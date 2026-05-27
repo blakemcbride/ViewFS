@@ -35,11 +35,17 @@ int cmd_init(int argc, char **argv) {
     const char *reinit_s = cli_take_flag(&argc, argv, "--reinit", 1);
     int reinit = reinit_s != NULL;
 
-    if (argc != 3) {
+    const char *store_path = (argc >= 3) ? argv[2] : NULL;
+    if (!store_path) {
+        const char *env_store = getenv("VIEWFS_STORE");
+        if (env_store && *env_store) store_path = env_store;
+    }
+    if (!store_path || argc > 3) {
         fprintf(stderr,
-"Usage: viewfs init STORE_PATH [--pg CONNINFO] [--schema NAME] [--reinit]\n"
+"Usage: viewfs init [STORE_PATH] [--pg CONNINFO] [--schema NAME] [--reinit]\n"
 "\n"
-"  STORE_PATH    directory to hold config + content blobs\n"
+"  STORE_PATH    directory to hold config + content blobs. If omitted,\n"
+"                falls back to $VIEWFS_STORE.\n"
 "  --pg CONNINFO libpq connection string. If omitted, the conninfo is\n"
 "                built from VIEWFS_PG_USER (optional) and\n"
 "                VIEWFS_PG_DATABASE (defaults to 'viewfs' if unset).\n"
@@ -49,7 +55,6 @@ int cmd_init(int argc, char **argv) {
 "  --reinit      allow overwriting an existing config.toml.\n");
         return 2;
     }
-    const char *store_path = argv[2];
 
     /* If --pg wasn't given, synthesize one from VIEWFS_PG_USER / _DATABASE.
      * Either or both may be unset, in which case libpq's own defaults apply

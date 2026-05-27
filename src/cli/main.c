@@ -11,7 +11,7 @@ static void print_usage(FILE *out) {
 "Usage: viewfs <command> [options...]\n"
 "\n"
 "Repository:\n"
-"  init STORE_PATH [--pg CONNINFO] [--schema NAME] [--reinit]\n"
+"  init [STORE_PATH] [--pg CONNINFO] [--schema NAME] [--reinit]\n"
 "  status                           show store status\n"
 "\n"
 "Views:\n"
