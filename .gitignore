@@ -1,0 +1,14 @@
+# Build output
+build/
+viewfs
+viewfs-fuse
+
+# Common C build leftovers (in case anyone builds outside build/)
+*.o
+*.a
+*.so
+
+# Editor / OS temporaries
+*.swp
+*~
+.DS_Store
