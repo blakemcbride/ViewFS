@@ -9,7 +9,7 @@
 
 static int usage(void) {
     fprintf(stderr,
-"Usage: viewfs mount --view NAME [--ro] [--foreground] [--verbose] MOUNTPOINT\n"
+"Usage: viewfs mount VIEW [--ro] [--foreground] [--verbose] MOUNTPOINT\n"
 "\n"
 "  Delegates to viewfs-fuse. The daemon backgrounds itself unless\n"
 "  --foreground is given.\n");
@@ -32,15 +32,16 @@ static char *locate_daemon(void) {
 }
 
 int cmd_mount(int argc, char **argv) {
-    const char *view       = cli_take_flag(&argc, argv, "--view", 0);
     const char *ro         = cli_take_flag(&argc, argv, "--ro", 1);
     const char *foreground = cli_take_flag(&argc, argv, "--foreground", 1);
     if (!foreground) foreground = cli_take_flag(&argc, argv, "-f", 1);
     const char *verbose    = cli_take_flag(&argc, argv, "--verbose", 1);
     if (!verbose) verbose = cli_take_flag(&argc, argv, "-v", 1);
 
-    if (!view || argc != 3) return usage();
-    const char *mountpoint = argv[2];
+    /* After flag consumption argv should be: viewfs, mount, VIEW, MOUNTPOINT */
+    if (argc != 4) return usage();
+    const char *view       = argv[2];
+    const char *mountpoint = argv[3];
 
     const char *store = getenv("VIEWFS_STORE");
     if (!store || !*store) {

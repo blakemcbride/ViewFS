@@ -122,7 +122,7 @@ A mount exposes a view at a directory of your choice:
 
 ```sh
 mkdir -p ~/mnt/programming
-viewfs mount --view programming ~/mnt/programming
+viewfs mount programming ~/mnt/programming
 ```
 
 `viewfs mount` spawns the daemon, which backgrounds itself and starts
@@ -244,7 +244,7 @@ Mount the new view and you'll see the same file:
 
 ```sh
 mkdir -p ~/mnt/writing
-viewfs mount --view writing ~/mnt/writing
+viewfs mount writing ~/mnt/writing
 cat ~/mnt/writing/docs/readme.md
 ```
 
@@ -445,7 +445,7 @@ Mount the new view and you'll see those entries:
 
 ```sh
 mkdir -p ~/mnt/archive
-viewfs mount --view archive ~/mnt/archive
+viewfs mount archive ~/mnt/archive
 ls ~/mnt/archive/by-tag/compiler
 ```
 
@@ -639,7 +639,7 @@ If something is misbehaving, mount the view with `--foreground
 --verbose` to see every callback as it happens:
 
 ```sh
-viewfs mount --view programming --foreground --verbose ~/mnt/programming
+viewfs mount programming --foreground --verbose ~/mnt/programming
 ```
 
 ```

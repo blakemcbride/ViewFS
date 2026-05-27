@@ -367,7 +367,7 @@ viewfs view list
 viewfs view show NAME
 viewfs view delete NAME
 
-viewfs mount --view NAME MOUNTPOINT [--foreground] [--verbose] [--ro]
+viewfs mount NAME MOUNTPOINT [--foreground] [--verbose] [--ro]
 viewfs unmount MOUNTPOINT                # wraps fusermount3 -u
 
 viewfs object import HOST_PATH [--into VIEW:PATH]...

@@ -80,7 +80,7 @@ holds.
 
 Deliverables:
 
-1. `viewfs mount --view NAME MOUNTPOINT [--ro] [--foreground]` —
+1. `viewfs mount NAME MOUNTPOINT [--ro] [--foreground]` —
    `fork(2)` + `setsid(2)` for daemon mode; PID file in
    `$STORE/daemons/<view>.pid`.
 2. `viewfs unmount MOUNTPOINT` — wraps `fusermount3 -u`.

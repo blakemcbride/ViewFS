@@ -144,7 +144,7 @@ The user shall be able to mount a named view at a mount point.
 Example command shape:
 
 ```sh
-viewfs mount --view programming ~/mnt/programming
+viewfs mount programming ~/mnt/programming
 ```
 
 After mounting, ordinary shell commands shall work:
@@ -196,8 +196,8 @@ Different views may be mounted at different mount points at the same time.
 Example command shape:
 
 ```sh
-viewfs mount --view programming ~/mnt/programming
-viewfs mount --view writing ~/mnt/writing
+viewfs mount programming ~/mnt/programming
+viewfs mount writing ~/mnt/writing
 ```
 
 The same object may appear in both views.
@@ -576,7 +576,7 @@ viewfs view show VIEW_NAME
 ### 13.3 Mount Commands
 
 ```sh
-viewfs mount --view VIEW_NAME MOUNTPOINT
+viewfs mount VIEW_NAME MOUNTPOINT
 viewfs unmount MOUNTPOINT
 ```
 

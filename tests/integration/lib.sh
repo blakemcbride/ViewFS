@@ -76,7 +76,7 @@ mount_view() {
   local view=$1
   local mountpoint=$2
   mkdir -p "$mountpoint"
-  "$VFS" mount --view "$view" "$mountpoint"
+  "$VFS" mount "$view" "$mountpoint"
   local i=0
   while (( i < 50 )); do
     if mount_in_procmounts "$mountpoint"; then return 0; fi

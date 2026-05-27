@@ -188,7 +188,7 @@ unambiguous prefix.
 
 ```sh
 mkdir -p /tmp/mnt/programming
-./viewfs mount   --view programming /tmp/mnt/programming
+./viewfs mount   programming /tmp/mnt/programming
 ./viewfs unmount /tmp/mnt/programming
 ```
 

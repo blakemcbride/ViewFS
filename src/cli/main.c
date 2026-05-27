@@ -42,7 +42,7 @@ static void print_usage(FILE *out) {
 "  find --tag TAG | --attr KEY[=VALUE]\n"
 "\n"
 "Mounting:\n"
-"  mount --view NAME [--ro] [--foreground] [--verbose] MOUNTPOINT\n"
+"  mount NAME [--ro] [--foreground] [--verbose] MOUNTPOINT\n"
 "  unmount MOUNTPOINT\n"
 "\n"
 "Diagnostics:\n"

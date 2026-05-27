@@ -138,8 +138,8 @@ note "all view paths pointing at the shared object:"
 pause
 
 step "Step 7: mount both views simultaneously"
-"$VFS" mount --view programming "$MNT_BASE/programming"
-"$VFS" mount --view writing     "$MNT_BASE/writing"
+"$VFS" mount programming "$MNT_BASE/programming"
+"$VFS" mount writing     "$MNT_BASE/writing"
 sleep 0.3
 mount | awk -v m="$MNT_BASE" '$0 ~ m'
 pause
@@ -183,8 +183,8 @@ step "Step 13: unmount, then remount"
 "$VFS" unmount "$MNT_BASE/writing"
 sleep 0.3
 note "both views unmounted; remounting..."
-"$VFS" mount --view programming "$MNT_BASE/programming"
-"$VFS" mount --view writing     "$MNT_BASE/writing"
+"$VFS" mount programming "$MNT_BASE/programming"
+"$VFS" mount writing     "$MNT_BASE/writing"
 sleep 0.3
 pause
 
