@@ -248,12 +248,19 @@ variable once:
 export VIEWFS_STORE="$HOME/.local/share/viewfs"
 ```
 
-Initialize that store (creates the directory and the PostgreSQL schema):
+Initialize that store (creates the directory and the PostgreSQL schema).
+You can either pass `--pg CONNINFO` explicitly, or set
+`VIEWFS_PG_USER` and `VIEWFS_PG_DATABASE` and let `init` pick them up:
 
 ```sh
-viewfs init "$VIEWFS_STORE" --pg \
-    'host=/var/run/postgresql user=postgres dbname=viewfs'
+export VIEWFS_PG_USER=postgres
+export VIEWFS_PG_DATABASE=viewfs
+viewfs init "$VIEWFS_STORE"
 ```
+
+For anything beyond user and database (custom host, port, sslmode,
+service file, etc.) pass `--pg CONNINFO` with a full libpq connection
+string.
 
 You're now ready for the tutorial in `RUNNING.md`.
 

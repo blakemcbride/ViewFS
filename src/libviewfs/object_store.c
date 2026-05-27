@@ -78,7 +78,10 @@ vfs_error vfs_content_import_host(vfs_store *s, const char *host_path,
                                   const vfs_object_id *id,
                                   int64_t *out_size,
                                   int     *out_mode,
-                                  int64_t *out_mtime_ns) {
+                                  int64_t *out_mtime_ns,
+                                  char    *checksum_hex_out,
+                                  void    *checksum_state_out,
+                                  size_t  *checksum_state_len_out) {
     if (!s || !host_path || !id) return VFS_ERR_BADARGS;
 
     struct stat st;
@@ -107,6 +110,18 @@ vfs_error vfs_content_import_host(vfs_store *s, const char *host_path,
         return VFS_ERR_IO;
     }
 
+    /* If the caller asked for the hash and/or its intermediate state,
+     * stream-hash the bytes as they pass through this copy loop. */
+    vfs_sha256_stream sha = { 0 };
+    int want_hash = (checksum_hex_out != NULL) || (checksum_state_out != NULL);
+    if (want_hash) {
+        rc = vfs_sha256_stream_init(&sha);
+        if (rc != VFS_OK) {
+            close(sfd); close(tfd); unlink(tmp);
+            return rc;
+        }
+    }
+
     char buf[64 * 1024];
     for (;;) {
         ssize_t r = read(sfd, buf, sizeof buf);
@@ -114,15 +129,18 @@ vfs_error vfs_content_import_host(vfs_store *s, const char *host_path,
         if (r < 0) {
             if (errno == EINTR) continue;
             vfs_seterr(s, "read %s: %s", host_path, strerror(errno));
+            if (want_hash) vfs_sha256_stream_abort(&sha);
             close(sfd); close(tfd); unlink(tmp);
             return VFS_ERR_IO;
         }
+        if (want_hash) vfs_sha256_stream_update(&sha, buf, (size_t)r);
         ssize_t off = 0;
         while (off < r) {
             ssize_t w = write(tfd, buf + off, (size_t)(r - off));
             if (w < 0) {
                 if (errno == EINTR) continue;
                 vfs_seterr(s, "write %s: %s", tmp, strerror(errno));
+                if (want_hash) vfs_sha256_stream_abort(&sha);
                 close(sfd); close(tfd); unlink(tmp);
                 return VFS_ERR_IO;
             }
@@ -130,6 +148,21 @@ vfs_error vfs_content_import_host(vfs_store *s, const char *host_path,
         }
     }
     close(sfd);
+
+    /* Snapshot the state (so the FUSE daemon can resume appending later)
+     * BEFORE finalizing, since finalize consumes the context. */
+    if (want_hash) {
+        if (checksum_state_out) {
+            vfs_sha256_stream_snapshot(&sha, checksum_state_out);
+            if (checksum_state_len_out)
+                *checksum_state_len_out = VFS_SHA256_STATE_LEN;
+        }
+        if (checksum_hex_out) {
+            vfs_sha256_stream_finalize(&sha, checksum_hex_out);
+        } else {
+            vfs_sha256_stream_abort(&sha);
+        }
+    }
     if (fsync(tfd) != 0) {
         vfs_seterr(s, "fsync %s: %s", tmp, strerror(errno));
         close(tfd); unlink(tmp);

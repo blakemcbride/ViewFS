@@ -1,5 +1,6 @@
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,10 +19,20 @@ struct findings {
     int64_t content_orphan_files;    /* content files with no object row */
     int     schema_drift;            /* 0 OK, 1 ahead, -1 behind */
     int     fixed_orphan_files;      /* --fix removals */
+    /* Phase 4: checksum coverage + verification */
+    int64_t files_total;             /* objects with kind='file' */
+    int64_t files_with_checksum;     /* checksum column non-NULL */
+    int64_t checksums_filled;        /* --fill-checksums: newly populated */
+    int64_t checksums_fill_failed;   /* --fill-checksums: failed to hash */
+    int64_t checksums_verified_ok;   /* --verify-checksums: matched */
+    int64_t checksums_mismatch;      /* --verify-checksums: stored != recomputed */
+    int64_t checksums_verify_failed; /* --verify-checksums: couldn't read content */
     /* helpers for cross-checks */
     vfs_store *store;
     int        verbose;
     int        do_fix;
+    int        do_fill;
+    int        do_verify;
 };
 
 /* Phase 1: DB integrity ---------------------------------------------------- */
@@ -176,18 +187,139 @@ static int phase3_schema(struct findings *f) {
     return 0;
 }
 
+/* Phase 4: checksum coverage (always) + optional fill / verify. */
+
+static void checksum_phase_cb(const vfs_object_info *o, void *ud) {
+    struct findings *f = ud;
+    if (!o->kind || strcmp(o->kind, "file") != 0) return;
+    f->files_total++;
+
+    if (o->checksum) {
+        f->files_with_checksum++;
+        if (f->do_verify) {
+            char path[VFS_PATH_MAX];
+            if (vfs_content_path(f->store, &o->id, path, sizeof path) != VFS_OK) {
+                f->checksums_verify_failed++;
+                return;
+            }
+            char recomputed[65];
+            if (vfs_sha256_hex_path(path, recomputed) != VFS_OK) {
+                f->checksums_verify_failed++;
+                if (f->verbose)
+                    fprintf(stdout, "    VERIFY-IO-ERROR: id=%s\n", o->id.hex);
+                return;
+            }
+            if (strcmp(recomputed, o->checksum) == 0) {
+                f->checksums_verified_ok++;
+            } else {
+                f->checksums_mismatch++;
+                if (f->verbose)
+                    fprintf(stdout,
+                        "    CHECKSUM-MISMATCH: id=%s stored=%s recomputed=%s\n",
+                        o->id.hex, o->checksum, recomputed);
+            }
+        }
+    } else if (f->do_fill) {
+        /* Recompute hash AND state so subsequent appends can resume. */
+        char path[VFS_PATH_MAX];
+        if (vfs_content_path(f->store, &o->id, path, sizeof path) != VFS_OK) {
+            f->checksums_fill_failed++;
+            return;
+        }
+        int fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            f->checksums_fill_failed++;
+            return;
+        }
+        vfs_sha256_stream sha = { 0 };
+        if (vfs_sha256_stream_init(&sha) != VFS_OK) {
+            close(fd); f->checksums_fill_failed++; return;
+        }
+        unsigned char buf[64 * 1024];
+        int ok = 1;
+        for (;;) {
+            ssize_t n = read(fd, buf, sizeof buf);
+            if (n == 0) break;
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                ok = 0; break;
+            }
+            if (vfs_sha256_stream_update(&sha, buf, (size_t)n) != VFS_OK) {
+                ok = 0; break;
+            }
+        }
+        close(fd);
+        if (!ok) {
+            vfs_sha256_stream_abort(&sha);
+            f->checksums_fill_failed++;
+            return;
+        }
+        unsigned char state[VFS_SHA256_STATE_LEN];
+        char hex[65];
+        if (vfs_sha256_stream_snapshot(&sha, state) != VFS_OK ||
+            vfs_sha256_stream_finalize(&sha, hex)   != VFS_OK) {
+            f->checksums_fill_failed++;
+            return;
+        }
+        if (vfs_object_set_checksum(f->store, &o->id, hex, state, sizeof state)
+            != VFS_OK) {
+            f->checksums_fill_failed++;
+            return;
+        }
+        f->checksums_filled++;
+        f->files_with_checksum++;
+        if (f->verbose)
+            fprintf(stdout, "    FILLED: id=%s checksum=%s\n", o->id.hex, hex);
+    }
+}
+
+static int phase4_checksums(struct findings *f) {
+    fprintf(stdout, "[4/4] Checksum coverage:\n");
+    vfs_object_list(f->store, checksum_phase_cb, f);
+    fprintf(stdout, "  file objects:                       %lld\n",
+            (long long)f->files_total);
+    fprintf(stdout, "  with checksum:                      %lld\n",
+            (long long)f->files_with_checksum);
+    fprintf(stdout, "  without checksum:                   %lld\n",
+            (long long)(f->files_total - f->files_with_checksum));
+    if (f->do_fill) {
+        fprintf(stdout, "  filled (this run):                  %lld\n",
+                (long long)f->checksums_filled);
+        if (f->checksums_fill_failed)
+            fprintf(stdout, "  fill failures:                      %lld\n",
+                    (long long)f->checksums_fill_failed);
+    }
+    if (f->do_verify) {
+        fprintf(stdout, "  verified ok:                        %lld\n",
+                (long long)f->checksums_verified_ok);
+        fprintf(stdout, "  mismatches:                         %lld\n",
+                (long long)f->checksums_mismatch);
+        if (f->checksums_verify_failed)
+            fprintf(stdout, "  verify failures (I/O):              %lld\n",
+                    (long long)f->checksums_verify_failed);
+    }
+    return 0;
+}
+
 /* ------------------------------------------------------------------------- */
 
 int cmd_check(int argc, char **argv) {
-    const char *fix     = cli_take_flag(&argc, argv, "--fix",     1);
-    const char *verbose = cli_take_flag(&argc, argv, "--verbose", 1);
-    if (!verbose) verbose = cli_take_flag(&argc, argv, "-v",      1);
+    const char *fix       = cli_take_flag(&argc, argv, "--fix",              1);
+    const char *fill_cs   = cli_take_flag(&argc, argv, "--fill-checksums",   1);
+    const char *verify_cs = cli_take_flag(&argc, argv, "--verify-checksums", 1);
+    const char *verbose   = cli_take_flag(&argc, argv, "--verbose",          1);
+    if (!verbose) verbose = cli_take_flag(&argc, argv, "-v",                 1);
     if (argc != 2) {
         fprintf(stderr,
-            "Usage: viewfs check [--fix] [--verbose]\n"
+            "Usage: viewfs check [--fix] [--fill-checksums] "
+            "[--verify-checksums] [--verbose]\n"
             "\n"
-            "  Runs a three-phase consistency scan over the store.\n"
-            "  --fix removes orphan content files only (never deletes objects).\n");
+            "  Four-phase consistency scan + checksum-coverage report.\n"
+            "  --fix               removes orphan content files only.\n"
+            "  --fill-checksums    compute SHA-256 (+ resumable state) for\n"
+            "                      every file object with a NULL checksum.\n"
+            "  --verify-checksums  re-hash every file with a stored checksum\n"
+            "                      and report mismatches.\n");
         return 2;
     }
 
@@ -196,13 +328,16 @@ int cmd_check(int argc, char **argv) {
     if (!s) return rc_open;
 
     struct findings f = {
-        .store = s,
-        .verbose = verbose != NULL,
-        .do_fix  = fix     != NULL,
+        .store     = s,
+        .verbose   = verbose   != NULL,
+        .do_fix    = fix       != NULL,
+        .do_fill   = fill_cs   != NULL,
+        .do_verify = verify_cs != NULL,
     };
-    phase1_db     (&f);
-    phase2_content(&f);
-    phase3_schema (&f);
+    phase1_db       (&f);
+    phase2_content  (&f);
+    phase3_schema   (&f);
+    phase4_checksums(&f);
 
     int problems =
         (f.bad_object_refs > 0) +
@@ -210,7 +345,8 @@ int cmd_check(int argc, char **argv) {
         (f.content_missing > 0) +
         (f.content_size_mismatch > 0) +
         (f.content_orphan_files > f.fixed_orphan_files) +
-        (f.schema_drift != 0);
+        (f.schema_drift != 0) +
+        (f.checksums_mismatch > 0);
 
     fprintf(stdout, "\n");
     if (problems == 0)

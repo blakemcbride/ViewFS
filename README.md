@@ -128,9 +128,15 @@ sudo -u postgres createdb -O "$USER" viewfs
 ## Quick start
 
 ```sh
-./viewfs init /tmp/vfs --pg "host=/var/run/postgresql user=postgres dbname=viewfs"
+export VIEWFS_PG_USER=postgres
+export VIEWFS_PG_DATABASE=viewfs
+./viewfs init /tmp/vfs
 export VIEWFS_STORE=/tmp/vfs   # avoids repeating --store on every call
 ```
+
+`viewfs init` builds its libpq conninfo from `VIEWFS_PG_USER` and
+`VIEWFS_PG_DATABASE` (each optional); pass `--pg CONNINFO` instead for
+non-default host, port, password, or other libpq options.
 
 `viewfs init` creates `/tmp/vfs/{config.toml,objects/,tmp/,daemons/,logs/}`
 and creates the PostgreSQL `viewfs` schema with the tables defined in

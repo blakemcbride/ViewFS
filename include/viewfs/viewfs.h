@@ -13,7 +13,7 @@ extern "C" {
 #define VIEWFS_VERSION_PATCH 0
 
 /* Schema version this build expects in the database. */
-#define VIEWFS_SCHEMA_VERSION 1
+#define VIEWFS_SCHEMA_VERSION 2
 
 /* Length of a hex-encoded object id, without trailing NUL. */
 #define VFS_OID_HEX_LEN 32
@@ -145,12 +145,20 @@ vfs_error vfs_content_path(const vfs_store *s, const vfs_object_id *id,
                            char *buf, size_t bufsz);
 
 /* Copy a host file into the store as the content of `id` via tmp+rename.
- * Returns the on-disk size, mode, and mtime via out_* (any may be NULL). */
+ * Returns the on-disk size, mode, and mtime via out_* (any may be NULL).
+ * If checksum_hex_out is non-NULL, writes the SHA-256 of the copied
+ * bytes (64 lowercase hex + NUL) into that 65-byte buffer.
+ * If checksum_state_out is non-NULL, writes the SHA-256 intermediate
+ * state (suitable for resuming an append) — buffer must be at least
+ * 128 bytes; the actual length is written to *checksum_state_len_out. */
 vfs_error vfs_content_import_host(vfs_store *s, const char *host_path,
                                   const vfs_object_id *id,
                                   int64_t *out_size,
                                   int     *out_mode,
-                                  int64_t *out_mtime_ns);
+                                  int64_t *out_mtime_ns,
+                                  char    *checksum_hex_out,
+                                  void    *checksum_state_out,
+                                  size_t  *checksum_state_len_out);
 
 /* Create an empty content file for a freshly-created object. */
 vfs_error vfs_content_create_empty(vfs_store *s, const vfs_object_id *id);
@@ -182,34 +190,94 @@ vfs_error vfs_view_exists(vfs_store *s, const char *name, int *out_exists);
 
 typedef struct {
     vfs_object_id id;
-    const char   *kind;        /* "file" | "symlink" */
+    const char   *kind;             /* "file" | "symlink" */
     int64_t       size;
     int           mode;
+    int           uid;              /* -1 if column was NULL */
+    int           gid;              /* -1 if column was NULL */
     int64_t       ctime_ns;
     int64_t       mtime_ns;
     int64_t       atime_ns;
-    const char   *source_path; /* may be NULL */
-    const char   *checksum;    /* may be NULL */
+    const char   *source_path;      /* may be NULL */
+    const char   *checksum;         /* may be NULL (always NULL for symlinks) */
+    int           has_checksum_state; /* 1 if checksum_state column is non-NULL */
 } vfs_object_info;
 
 typedef void (*vfs_object_cb)(const vfs_object_info *info, void *ud);
 
-/* Insert an objects row of kind='file'. Does not touch content storage. */
+/* Insert an objects row of kind='file'. Does not touch content storage.
+ * uid/gid/checksum/state may be -1 / -1 / NULL / NULL+0 to leave NULL.
+ * If state is non-NULL, state_len must be > 0. */
 vfs_error vfs_object_create_file(vfs_store     *s,
                                  int            mode,
                                  int64_t        size,
+                                 int            uid,
+                                 int            gid,
+                                 const char    *checksum,
+                                 const void    *state,
+                                 size_t         state_len,
                                  const char    *source_path,
                                  int64_t        mtime_ns,
                                  vfs_object_id *out_id);
 
 /* Insert an objects row using a caller-supplied id and full timestamp set.
  * Used by `object import` so the metadata row matches the just-written
- * content file. */
+ * content file. uid/gid/checksum/state may be -1 / -1 / NULL / NULL+0. */
 vfs_error vfs_object_insert_existing(vfs_store *s, const vfs_object_id *id,
                                      const char *kind, int mode, int64_t size,
+                                     int uid, int gid,
+                                     const char *checksum,
+                                     const void *state, size_t state_len,
                                      int64_t ctime_ns, int64_t mtime_ns,
                                      int64_t atime_ns,
                                      const char *source_path);
+
+/* Update uid and/or gid on an existing object. Pass -1 for either field
+ * to leave it unchanged (the conventional chown sentinel). */
+vfs_error vfs_object_set_owner   (vfs_store *s, const vfs_object_id *id,
+                                  int uid, int gid);
+
+/* Atomically set both the checksum (hex) and the intermediate state
+ * columns on an existing object. Pass (NULL, NULL, 0) to clear both. */
+vfs_error vfs_object_set_checksum(vfs_store *s, const vfs_object_id *id,
+                                  const char *checksum_hex,
+                                  const void *state, size_t state_len);
+
+/* ---------------------------------------------------------------- *
+ * SHA-256 helpers (used by import, FUSE write path, and check verify)
+ * ---------------------------------------------------------------- */
+
+/* Number of bytes needed to snapshot the streaming SHA-256 state.
+ * Matches OpenSSL's SHA256_CTX layout. */
+#define VFS_SHA256_STATE_LEN 112
+
+/* Streaming SHA-256 context. `ctx` is opaque; treat the struct as a
+ * by-value handle that's safe to keep on the stack. */
+typedef struct vfs_sha256_stream {
+    void *ctx;
+} vfs_sha256_stream;
+
+/* SHA-256 of the file at `path`, written as 64 lowercase hex + NUL. */
+vfs_error vfs_sha256_hex_path       (const char *path, char hex_out[65]);
+
+/* Streaming API: init → update*N → (snapshot|peek_hex)? → finalize. */
+vfs_error vfs_sha256_stream_init    (vfs_sha256_stream *st);
+vfs_error vfs_sha256_stream_update  (vfs_sha256_stream *st,
+                                     const void *buf, size_t n);
+/* Copy the in-progress state into a VFS_SHA256_STATE_LEN-byte buffer.
+ * Stream remains usable; restore later with vfs_sha256_stream_restore. */
+vfs_error vfs_sha256_stream_snapshot(vfs_sha256_stream *st, void *state_out);
+/* Peek at the would-be final hex digest without consuming the stream. */
+vfs_error vfs_sha256_stream_peek_hex(vfs_sha256_stream *st, char hex_out[65]);
+/* Finalize: writes the hex digest and tears down the context. */
+vfs_error vfs_sha256_stream_finalize(vfs_sha256_stream *st, char hex_out[65]);
+/* Tear down without producing a digest. */
+void      vfs_sha256_stream_abort   (vfs_sha256_stream *st);
+/* Resume a previously-snapshotted stream. state_len must equal
+ * VFS_SHA256_STATE_LEN. After restore the stream behaves as if every
+ * byte hashed into the original stream had just been re-fed. */
+vfs_error vfs_sha256_stream_restore (vfs_sha256_stream *st,
+                                     const void *state_in, size_t state_len);
 
 vfs_error vfs_object_get(vfs_store *s, const vfs_object_id *id,
                          vfs_object_info *out);
@@ -261,6 +329,14 @@ vfs_error vfs_mapping_list_view  (vfs_store *s, const char *view,
                                   vfs_mapping_cb cb, void *ud);
 vfs_error vfs_mapping_list_object(vfs_store *s, const vfs_object_id *id,
                                   vfs_mapping_cb cb, void *ud);
+
+/* Look up the object id for an exact view_path in a view.
+ *   VFS_OK              -- *out set; the mapping is a file or symlink.
+ *   VFS_ERR_NOTFOUND    -- no mapping exists at that path.
+ *   VFS_ERR_ISDIR       -- a mapping exists but is a directory (no object).
+ *   (path canonicalization errors propagate.) */
+vfs_error vfs_mapping_object_id(vfs_store *s, const char *view,
+                                const char *view_path, vfs_object_id *out);
 
 /* ---------------------------------------------------------------- *
  * Attributes

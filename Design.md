@@ -77,6 +77,16 @@ conninfo = "host=/var/run/postgresql dbname=viewfs user=blake"
 schema   = "viewfs"
 ```
 
+The PostgreSQL schema is versioned via `schema_migrations`. The current
+binary expects version 2:
+
+- `0001_init.sql` — the bulk of the schema (objects, views, mappings,
+  attributes, tags) plus the `uid`/`gid`/`checksum` columns that the
+  daemon now populates.
+- `0002_checksum_state.sql` — adds `objects.checksum_state BYTEA` so
+  the FUSE daemon can resume an append-only SHA-256 stream after the
+  file is closed and reopened. See `Checksum maintenance` below.
+
 If the `[postgres]` section is omitted, libviewfs falls back to
 `PGHOST`/`PGUSER`/`PGDATABASE` etc. from the environment.
 
@@ -103,12 +113,13 @@ CREATE TABLE objects (
   kind            TEXT NOT NULL CHECK (kind IN ('file','symlink')),
   size            BIGINT NOT NULL DEFAULT 0,
   mode            INTEGER NOT NULL,                 -- POSIX mode bits
-  uid             INTEGER,
+  uid             INTEGER,                          -- captured from fuse_get_context
   gid             INTEGER,
   ctime_ns        BIGINT NOT NULL,
   mtime_ns        BIGINT NOT NULL,
   atime_ns        BIGINT NOT NULL,
-  checksum        TEXT,                             -- optional sha256 hex
+  checksum        TEXT,                             -- SHA-256 hex; NULL on internal write
+  checksum_state  BYTEA,                            -- 112-byte SHA256_CTX; resumes append-only updates
   source_path     TEXT,                             -- informational
   symlink_target  TEXT                              -- only when kind='symlink'
 );
@@ -269,13 +280,34 @@ This is optional for v1 correctness (the daemon could always re-query), but
 it lets us enable a 1–2 second attribute cache via FUSE mount options
 without observing stale state during concurrent CLI mutations.
 
-### 5.6 File I/O is pass-through
+### 5.6 File I/O is pass-through (with incremental checksum)
 
 `open` resolves the mapping, fetches the object_id, opens
-`objects/<aa>/<id>` with the FUSE-supplied flags, and stashes the host fd
-in `fi->fh`. `read`, `write`, `truncate`, `fsync`, `release` operate on
-that fd. On `release` (or on size change in `write`), a single short
-transaction updates `objects.size` and `objects.mtime_ns`.
+`objects/<aa>/<id>` with the FUSE-supplied flags, and allocates a
+`struct vfs_ofile { fd, writable, modified, sha_live, known_size, sha }`
+which is stashed (by pointer) in `fi->fh`. `read`, `write`, `truncate`,
+`fsync`, `release` operate on `o->fd`.
+
+The checksum maintenance policy is implemented around `vfs_ofile`:
+
+| Event | What happens to the SHA stream |
+|---|---|
+| `op_create` | Init empty SHA, `sha_live=1`, `known_size=0`. Initial digest + state go straight into the INSERT. |
+| `op_open` for write | `try_load_checksum_state` does a single SELECT; if `db.size == fstat.size` and `checksum_state IS NOT NULL`, restore the stream and set `sha_live=1, known_size=db.size`. Otherwise `sha_live=0`. |
+| `op_write` at `off == known_size` (pure append) | `SHA256_Update` over the new bytes, advance `known_size`. |
+| `op_write` at any other offset | `sha_live=0` (the stored hash can't reflect the new content). |
+| `op_truncate` | `sha_live=0` (grow inserts zero bytes we never hashed; shrink removes bytes we did hash). |
+| `op_flush` (close) | Fsync, then a single UPDATE: if `sha_live`, write fresh size/mtime/atime/checksum/checksum_state; otherwise NULL both checksum columns. |
+
+The DB is touched twice per open/close cycle (one SELECT at open, one
+UPDATE at close) regardless of how many `write(2)`s occurred in
+between. An append-in-a-loop pattern like
+`for i ...; do echo $i >> log; done` therefore costs O(bytes
+appended) total instead of O(bytes × iterations).
+
+`viewfs check --fill-checksums` recomputes hash + state for any file
+with `checksum IS NULL`. `viewfs check --verify-checksums` re-hashes
+each non-NULL row's content and reports mismatches.
 
 ### 5.7 Create flow
 
@@ -341,6 +373,7 @@ viewfs unmount MOUNTPOINT                # wraps fusermount3 -u
 viewfs object import HOST_PATH [--into VIEW:PATH]...
 viewfs object show ID|PREFIX
 viewfs object paths ID|PREFIX
+viewfs object id VIEW VIEW_PATH
 viewfs object list [--orphaned]
 viewfs object delete ID|PREFIX
 viewfs object delete --orphaned [--dry-run]
@@ -365,8 +398,11 @@ Notes:
 - `init` is idempotent against an existing Postgres schema
   (`IF NOT EXISTS` everywhere). It refuses to overwrite an existing
   `config.toml` unless `--reinit` is passed. `--pg` is optional; if
-  omitted, libpq falls back to `PGHOST`/`PGUSER`/`PGDATABASE` env vars at
-  open time. The empty string is stored in `config.toml` to signal that.
+  omitted, `cmd_init` synthesizes a conninfo from the `VIEWFS_PG_USER`
+  and `VIEWFS_PG_DATABASE` env vars (each optional, libpq-quoted), and
+  any remaining field falls back to libpq's `PGHOST`/`PGPORT`/`PGUSER`/
+  `PGDATABASE` env vars or compiled-in defaults at open time. If none
+  of those are set, the empty string is stored in `config.toml`.
 - `object import` reads a host file, generates an object id, copies
   content into `objects/<aa>/<id>` via `tmp/` + atomic `rename`, then
   inserts the object row with that pre-allocated id via

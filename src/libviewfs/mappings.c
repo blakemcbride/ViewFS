@@ -243,6 +243,33 @@ vfs_error vfs_mapping_list_view(vfs_store *s, const char *view,
     return VFS_OK;
 }
 
+vfs_error vfs_mapping_object_id(vfs_store *s, const char *view,
+                                const char *view_path, vfs_object_id *out) {
+    if (!s || !view || !view_path || !out) return VFS_ERR_BADARGS;
+    vfs_canon_path cp;
+    vfs_error rc = vfs_path_canonicalize(view_path, &cp);
+    if (rc != VFS_OK) return rc;
+    if (cp.is_root) return VFS_ERR_ISDIR;
+
+    const char *params[2] = { view, cp.path };
+    PGresult *r = PQexecParams(s->pg,
+        "SELECT entry_kind, COALESCE(object_id, '') "
+        "FROM mappings WHERE view_name = $1 AND view_path = $2",
+        2, NULL, params, NULL, NULL, 0);
+    if (PQresultStatus(r) != PGRES_TUPLES_OK) {
+        vfs_seterr_pq(s, r); PQclear(r); return VFS_ERR_DB;
+    }
+    if (PQntuples(r) == 0) { PQclear(r); return VFS_ERR_NOTFOUND; }
+
+    const char *kind = PQgetvalue(r, 0, 0);
+    const char *oid  = PQgetvalue(r, 0, 1);
+    if (!strcmp(kind, "dir")) { PQclear(r); return VFS_ERR_ISDIR; }
+    if (!oid || !oid[0])      { PQclear(r); return VFS_ERR_INTERNAL; }
+    snprintf(out->hex, sizeof out->hex, "%s", oid);
+    PQclear(r);
+    return VFS_OK;
+}
+
 vfs_error vfs_mapping_list_object(vfs_store *s, const vfs_object_id *id,
                                   vfs_mapping_cb cb, void *ud) {
     if (!s || !id || !cb) return VFS_ERR_BADARGS;

@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>     /* getuid, getgid */
 
 #include "common.h"
 
@@ -10,6 +11,7 @@ static void print_usage(FILE *out) {
 "  object import HOST_PATH [--into VIEW:PATH]...\n"
 "  object show ID|PREFIX\n"
 "  object paths ID|PREFIX\n"
+"  object id VIEW VIEW_PATH\n"
 "  object list [--orphaned]\n"
 "  object delete ID|PREFIX\n"
 "  object delete --orphaned [--dry-run]\n");
@@ -50,12 +52,20 @@ static int sub_import(int argc, char **argv, vfs_store *s) {
 
     int64_t size = 0, mt = 0;
     int mode = 0644;
-    rc = vfs_content_import_host(s, host_path, &id, &size, &mode, &mt);
+    char  checksum_hex[65];
+    unsigned char checksum_state[128];
+    size_t checksum_state_len = 0;
+    rc = vfs_content_import_host(s, host_path, &id, &size, &mode, &mt,
+                                 checksum_hex,
+                                 checksum_state, &checksum_state_len);
     if (rc != VFS_OK) return cli_perror(s, rc, "object import");
 
     int64_t now = vfs_now_ns();
     if (!mt) mt = now;
     rc = vfs_object_insert_existing(s, &id, "file", mode, size,
+                                    (int)getuid(), (int)getgid(),
+                                    checksum_hex,
+                                    checksum_state, checksum_state_len,
                                     now, mt, now, host_path);
     if (rc != VFS_OK) {
         vfs_content_unlink(s, &id);
@@ -107,7 +117,14 @@ static int sub_show(int argc, char **argv, vfs_store *s) {
     printf("  kind:        %s\n", info.kind);
     printf("  size:        %lld\n", (long long)info.size);
     printf("  mode:        %04o\n", info.mode);
+    if (info.uid >= 0) printf("  uid:         %d\n", info.uid);
+    else               printf("  uid:         -\n");
+    if (info.gid >= 0) printf("  gid:         %d\n", info.gid);
+    else               printf("  gid:         -\n");
     printf("  source_path: %s\n", info.source_path ? info.source_path : "-");
+    printf("  checksum:    %s%s\n",
+           info.checksum ? info.checksum : "-",
+           info.has_checksum_state ? " (resumable)" : "");
     printf("  ctime_ns:    %lld\n", (long long)info.ctime_ns);
     printf("  mtime_ns:    %lld\n", (long long)info.mtime_ns);
     return 0;
@@ -128,6 +145,27 @@ static int sub_paths(int argc, char **argv, vfs_store *s) {
     printf("object %s:\n", id.hex);
     rc = vfs_mapping_list_object(s, &id, print_mapping_for_obj, NULL);
     if (rc != VFS_OK) return cli_perror(s, rc, "object paths");
+    return 0;
+}
+
+static int sub_id(int argc, char **argv, vfs_store *s) {
+    /* argv[0]=viewfs, argv[1]=object, argv[2]=id, argv[3]=VIEW, argv[4]=PATH */
+    if (argc != 5) return usage();
+    const char *view = argv[3];
+    const char *path = argv[4];
+    vfs_object_id id;
+    vfs_error rc = vfs_mapping_object_id(s, view, path, &id);
+    if (rc == VFS_ERR_NOTFOUND) {
+        fprintf(stderr, "viewfs: no mapping at %s:%s\n", view, path);
+        return 1;
+    }
+    if (rc == VFS_ERR_ISDIR) {
+        fprintf(stderr, "viewfs: %s:%s is a directory (no object id)\n",
+                view, path);
+        return 1;
+    }
+    if (rc != VFS_OK) return cli_perror(s, rc, "object id");
+    printf("%s\n", id.hex);
     return 0;
 }
 
@@ -225,6 +263,7 @@ int cmd_object(int argc, char **argv) {
     if      (!strcmp(sub, "import")) rc = sub_import(argc, argv, s);
     else if (!strcmp(sub, "show"))   rc = sub_show  (argc, argv, s);
     else if (!strcmp(sub, "paths"))  rc = sub_paths (argc, argv, s);
+    else if (!strcmp(sub, "id"))     rc = sub_id    (argc, argv, s);
     else if (!strcmp(sub, "list"))   rc = sub_list  (argc, argv, s);
     else if (!strcmp(sub, "delete")) rc = sub_delete(argc, argv, s);
     else { vfs_store_close(s); return usage(); }

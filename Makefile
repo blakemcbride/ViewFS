@@ -14,10 +14,12 @@ CPPFLAGS := -Iinclude -D_GNU_SOURCE -DFUSE_USE_VERSION=31
 CFLAGS   ?= $(CSTD) $(WARN) $(OPT)
 LDFLAGS  ?=
 
-PKG_FUSE3_CFLAGS := $(shell pkg-config --cflags fuse3)
-PKG_FUSE3_LIBS   := $(shell pkg-config --libs   fuse3)
-PKG_LIBPQ_CFLAGS := $(shell pkg-config --cflags libpq)
-PKG_LIBPQ_LIBS   := $(shell pkg-config --libs   libpq)
+PKG_FUSE3_CFLAGS  := $(shell pkg-config --cflags fuse3)
+PKG_FUSE3_LIBS    := $(shell pkg-config --libs   fuse3)
+PKG_LIBPQ_CFLAGS  := $(shell pkg-config --cflags libpq)
+PKG_LIBPQ_LIBS    := $(shell pkg-config --libs   libpq)
+PKG_CRYPTO_CFLAGS := $(shell pkg-config --cflags libcrypto)
+PKG_CRYPTO_LIBS   := $(shell pkg-config --libs   libcrypto)
 
 BUILD_DIR := build
 LIB_DIR   := $(BUILD_DIR)/libviewfs
@@ -47,7 +49,7 @@ all: $(CLI_BIN) $(FUSE_BIN)
 
 # libviewfs static library ----------------------------------------------------
 $(LIB_DIR)/%.o: src/libviewfs/%.c | $(LIB_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(PKG_LIBPQ_CFLAGS) -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(PKG_LIBPQ_CFLAGS) $(PKG_CRYPTO_CFLAGS) -c $< -o $@
 
 $(LIB_AR): $(LIB_OBJ)
 	ar rcs $@ $^
@@ -57,14 +59,14 @@ $(CLI_DIR)/%.o: src/cli/%.c | $(CLI_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(PKG_LIBPQ_CFLAGS) -c $< -o $@
 
 $(CLI_BIN): $(CLI_OBJ) $(LIB_AR)
-	$(CC) $(CFLAGS) $(CLI_OBJ) $(LIB_AR) $(PKG_LIBPQ_LIBS) -o $@ $(LDFLAGS)
+	$(CC) $(CFLAGS) $(CLI_OBJ) $(LIB_AR) $(PKG_LIBPQ_LIBS) $(PKG_CRYPTO_LIBS) -o $@ $(LDFLAGS)
 
 # viewfs-fuse daemon ----------------------------------------------------------
 $(FUSE_DIR)/%.o: src/fuse/%.c | $(FUSE_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(PKG_FUSE3_CFLAGS) $(PKG_LIBPQ_CFLAGS) -c $< -o $@
 
 $(FUSE_BIN): $(FUSE_OBJ) $(LIB_AR)
-	$(CC) $(CFLAGS) $(FUSE_OBJ) $(LIB_AR) $(PKG_FUSE3_LIBS) $(PKG_LIBPQ_LIBS) -o $@ $(LDFLAGS)
+	$(CC) $(CFLAGS) $(FUSE_OBJ) $(LIB_AR) $(PKG_FUSE3_LIBS) $(PKG_LIBPQ_LIBS) $(PKG_CRYPTO_LIBS) -o $@ $(LDFLAGS)
 
 # Build directories -----------------------------------------------------------
 $(LIB_DIR) $(CLI_DIR) $(FUSE_DIR):
@@ -80,7 +82,7 @@ UNIT_BIN  := $(patsubst tests/unit/%.c,$(TEST_DIR)/%,$(UNIT_SRC))
 
 $(TEST_DIR)/%: tests/unit/%.c $(LIB_AR) | $(TEST_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(PKG_LIBPQ_CFLAGS) $< $(LIB_AR) \
-	    $(PKG_LIBPQ_LIBS) -o $@ $(LDFLAGS)
+	    $(PKG_LIBPQ_LIBS) $(PKG_CRYPTO_LIBS) -o $@ $(LDFLAGS)
 
 $(TEST_DIR):
 	mkdir -p $@

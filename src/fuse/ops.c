@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <linux/fs.h>     /* RENAME_NOREPLACE, RENAME_EXCHANGE */
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,10 +19,46 @@
 
 viewfs_ctx CTX;
 
-/* fi->fh packing: lower 32 bits = fd; bit 32 = write-mode flag. */
-#define VFS_FH_WRITE_FLAG  (1ULL << 32)
-#define VFS_FH_FD(fh)      ((int)((fh) & 0xFFFFFFFFu))
-#define VFS_FH_IS_WRITE(fh) (((fh) & VFS_FH_WRITE_FLAG) != 0)
+/* Per-open-file state. fi->fh holds a pointer to one of these (allocated
+ * in op_open / op_create, freed in op_release). The SHA-256 fields
+ * implement the "incremental checksum for pure-append writes" policy:
+ *
+ *   sha_live=1 means the stream contains a valid running hash of the
+ *   bytes currently on disk under this object id. While that's true,
+ *   any op_write at offset == known_size advances the hash; any other
+ *   write (out-of-order, overwrite, truncate) invalidates it, after
+ *   which op_flush nulls the stored checksum + state. */
+struct vfs_ofile {
+    int               fd;
+    int               writable;     /* opened with non-O_RDONLY */
+    int               modified;     /* >=1 successful op_write or truncate */
+    int               sha_live;     /* SHA state tracks current on-disk bytes */
+    int64_t           known_size;   /* file size that the SHA covers */
+    vfs_sha256_stream sha;
+};
+#define VFS_OFILE(fi)  ((struct vfs_ofile *)(uintptr_t)(fi)->fh)
+
+static struct vfs_ofile *ofile_new(int fd, int writable) {
+    struct vfs_ofile *o = calloc(1, sizeof *o);
+    if (!o) return NULL;
+    o->fd       = fd;
+    o->writable = writable;
+    return o;
+}
+
+static void ofile_free(struct vfs_ofile *o) {
+    if (!o) return;
+    if (o->sha_live) vfs_sha256_stream_abort(&o->sha);
+    if (o->fd > 0)   close(o->fd);
+    free(o);
+}
+
+static void ofile_invalidate_sha(struct vfs_ofile *o) {
+    if (o->sha_live) {
+        vfs_sha256_stream_abort(&o->sha);
+        o->sha_live = 0;
+    }
+}
 
 static void trace(const char *fmt, ...) {
     if (!CTX.verbose) return;
@@ -62,12 +99,13 @@ static void fill_dir_stat(struct stat *st, int mode, int64_t mtime_ns) {
 }
 
 static void fill_file_stat(struct stat *st, int mode, int64_t size,
+                           int uid, int gid,
                            int64_t ctime_ns, int64_t mtime_ns, int64_t atime_ns) {
     memset(st, 0, sizeof *st);
     st->st_mode  = S_IFREG | (mode_t)(mode & 07777);
     st->st_nlink = 1;
-    st->st_uid   = getuid();
-    st->st_gid   = getgid();
+    st->st_uid   = (uid >= 0) ? (uid_t)uid : getuid();
+    st->st_gid   = (gid >= 0) ? (gid_t)gid : getgid();
     st->st_size  = size;
     st->st_blocks = (size + 511) / 512;
     st->st_ctim.tv_sec  = ctime_ns / 1000000000;
@@ -160,6 +198,44 @@ static int ensure_parent_dirs_pg(PGconn *pg, const char *view,
     return 0;
 }
 
+/* Try to load the persisted SHA-256 intermediate state for an object
+ * into the given ofile and mark it sha_live, but only if the DB's
+ * recorded size matches the current host-fd size — otherwise the state
+ * doesn't match the bytes we'd be about to append to. */
+static void try_load_checksum_state(PGconn *pg, const char *oid_hex,
+                                    struct vfs_ofile *o) {
+    struct stat st;
+    if (fstat(o->fd, &st) != 0) return;
+    const char *params[1] = { oid_hex };
+    PGresult *r = PQexecParams(pg,
+        "SELECT size, encode(checksum_state, 'hex') "
+        "FROM objects WHERE object_id = $1",
+        1, NULL, params, NULL, NULL, 0);
+    if (PQresultStatus(r) != PGRES_TUPLES_OK) { PQclear(r); return; }
+    if (PQntuples(r) != 1)                    { PQclear(r); return; }
+    if (PQgetisnull(r, 0, 1))                 { PQclear(r); return; }
+    int64_t db_size  = atoll(PQgetvalue(r, 0, 0));
+    if (db_size != (int64_t)st.st_size)       { PQclear(r); return; }
+
+    const char *hex = PQgetvalue(r, 0, 1);
+    size_t hex_len = strlen(hex);
+    if (hex_len != VFS_SHA256_STATE_LEN * 2)  { PQclear(r); return; }
+
+    unsigned char raw[VFS_SHA256_STATE_LEN];
+    for (size_t i = 0; i < VFS_SHA256_STATE_LEN; i++) {
+        unsigned hi = hex[2*i], lo = hex[2*i + 1];
+        hi = (hi >= 'a') ? (hi - 'a' + 10) : (hi - '0');
+        lo = (lo >= 'a') ? (lo - 'a' + 10) : (lo - '0');
+        raw[i] = (unsigned char)((hi << 4) | lo);
+    }
+    PQclear(r);
+
+    memset(&o->sha, 0, sizeof o->sha);
+    if (vfs_sha256_stream_restore(&o->sha, raw, sizeof raw) != VFS_OK) return;
+    o->sha_live   = 1;
+    o->known_size = db_size;
+}
+
 /* Look up a mapping by path. Returns 0 on hit, -ENOENT, -EIO, etc.
  * On hit, fills out_kind ("file"/"dir"/"symlink") and out_obj_id_hex
  * (empty for dirs). */
@@ -200,7 +276,8 @@ static int op_getattr(const char *path, struct stat *st,
     const char *params[2] = { CTX.view_name, cp.path };
     PGresult *r = PQexecParams(pg,
         "SELECT m.entry_kind, m.mode_override, m.mtime_ns, "
-        "       o.size, o.mode, o.ctime_ns, o.mtime_ns, o.atime_ns "
+        "       o.size, o.mode, o.ctime_ns, o.mtime_ns, o.atime_ns, "
+        "       o.uid, o.gid "
         "FROM mappings m "
         "LEFT JOIN objects o ON o.object_id = m.object_id "
         "WHERE m.view_name = $1 AND m.view_path = $2",
@@ -213,6 +290,8 @@ static int op_getattr(const char *path, struct stat *st,
     if (PQntuples(r) == 0) { PQclear(r); return -ENOENT; }
 
     const char *kind = PQgetvalue(r, 0, 0);
+    int uid = PQgetisnull(r, 0, 8) ? -1 : atoi(PQgetvalue(r, 0, 8));
+    int gid = PQgetisnull(r, 0, 9) ? -1 : atoi(PQgetvalue(r, 0, 9));
     if (!strcmp(kind, "dir")) {
         int mode = PQgetisnull(r, 0, 1) ? 0 : atoi(PQgetvalue(r, 0, 1));
         int64_t mt = atoll(PQgetvalue(r, 0, 2));
@@ -223,7 +302,7 @@ static int op_getattr(const char *path, struct stat *st,
         int64_t ctime_ns = atoll(PQgetvalue(r, 0, 5));
         int64_t mtime_ns = atoll(PQgetvalue(r, 0, 6));
         int64_t atime_ns = atoll(PQgetvalue(r, 0, 7));
-        fill_file_stat(st, mode, size, ctime_ns, mtime_ns, atime_ns);
+        fill_file_stat(st, mode, size, uid, gid, ctime_ns, mtime_ns, atime_ns);
     } else if (!strcmp(kind, "symlink")) {
         /* Symlink. Re-query the object row for the target so we can fill
          * st_size with strlen(target) -- ls -l displays this and some
@@ -231,8 +310,8 @@ static int op_getattr(const char *path, struct stat *st,
         memset(st, 0, sizeof *st);
         st->st_mode  = S_IFLNK | 0777;
         st->st_nlink = 1;
-        st->st_uid   = getuid();
-        st->st_gid   = getgid();
+        st->st_uid   = (uid >= 0) ? (uid_t)uid : getuid();
+        st->st_gid   = (gid >= 0) ? (gid_t)gid : getgid();
         int64_t ctime_ns = atoll(PQgetvalue(r, 0, 5));
         int64_t mtime_ns = atoll(PQgetvalue(r, 0, 6));
         int64_t atime_ns = atoll(PQgetvalue(r, 0, 7));
@@ -336,14 +415,22 @@ static int op_open(const char *path, struct fuse_file_info *fi) {
     int fd = open_content_file(&id, host_flags);
     if (fd < 0) return fd;
 
-    fi->fh = (uint64_t)fd;
-    if (wants_write) fi->fh |= VFS_FH_WRITE_FLAG;
+    struct vfs_ofile *o = ofile_new(fd, wants_write);
+    if (!o) { close(fd); return -ENOMEM; }
+    /* For an existing file opened for writing, try to resume the
+     * checksum stream from the DB. If the stored state's size doesn't
+     * match the current on-disk size (or there's no state), sha_live
+     * stays 0 and any write will null the checksum on close. */
+    if (wants_write && !(fi->flags & O_TRUNC)) {
+        try_load_checksum_state(pg, id.hex, o);
+    }
+    fi->fh = (uint64_t)(uintptr_t)o;
     return 0;
 }
 
 static int op_read(const char *path, char *buf, size_t size, off_t off,
                    struct fuse_file_info *fi) {
-    int fd = VFS_FH_FD(fi->fh);
+    int fd = VFS_OFILE(fi)->fd;
     ssize_t n;
     do { n = pread(fd, buf, size, off); }
     while (n < 0 && errno == EINTR);
@@ -354,17 +441,46 @@ static int op_read(const char *path, char *buf, size_t size, off_t off,
 
 static int op_write(const char *path, const char *buf, size_t size, off_t off,
                     struct fuse_file_info *fi) {
-    int fd = VFS_FH_FD(fi->fh);
+    struct vfs_ofile *o = VFS_OFILE(fi);
     ssize_t n;
-    do { n = pwrite(fd, buf, size, off); }
+    do { n = pwrite(o->fd, buf, size, off); }
     while (n < 0 && errno == EINTR);
+    if (n > 0) {
+        o->modified = 1;
+        if (o->sha_live && (int64_t)off == o->known_size) {
+            /* Pure append: extend the running hash in place. */
+            if (vfs_sha256_stream_update(&o->sha, buf, (size_t)n) == VFS_OK) {
+                o->known_size += n;
+            } else {
+                ofile_invalidate_sha(o);
+            }
+        } else if (o->sha_live) {
+            /* Out-of-order or overwrite: hash state is no longer valid
+             * for whatever the file content will end up being. */
+            ofile_invalidate_sha(o);
+        }
+    }
     int rc = (n < 0) ? -errno : (int)n;
     trace("write %s sz=%zu off=%lld -> %d", path, size, (long long)off, rc);
     return rc;
 }
 
-/* Update objects.size/mtime_ns/atime_ns from the host fd's stat. */
-static int sync_object_meta(PGconn *pg, const char *oid_hex, int fd) {
+/* Render `n` bytes as lowercase hex into out (which must hold 2*n+1). */
+static void bytes_to_hex(const unsigned char *in, size_t n, char *out) {
+    static const char H[] = "0123456789abcdef";
+    for (size_t i = 0; i < n; i++) {
+        out[2*i]     = H[(in[i] >> 4) & 0xF];
+        out[2*i + 1] = H[in[i] & 0xF];
+    }
+    out[2*n] = '\0';
+}
+
+/* Update size/mtime/atime, and (when ofile is non-NULL) the checksum
+ * columns too. If the per-fd SHA state is still live and covers the
+ * full current file size, write the new digest + intermediate state.
+ * Otherwise null both checksum columns — they're no longer trustworthy. */
+static int sync_object_meta(PGconn *pg, const char *oid_hex,
+                            struct vfs_ofile *o, int fd) {
     struct stat st;
     if (fstat(fd, &st) != 0) return -errno;
     I64STR(size_s,  (int64_t)st.st_size);
@@ -372,18 +488,45 @@ static int sync_object_meta(PGconn *pg, const char *oid_hex, int fd) {
     int64_t at_ns = (int64_t)st.st_atim.tv_sec * 1000000000LL + st.st_atim.tv_nsec;
     I64STR(mt_s, mt_ns);
     I64STR(at_s, at_ns);
+
+    int can_hash = o && o->sha_live && o->known_size == (int64_t)st.st_size;
+    if (can_hash) {
+        unsigned char state[VFS_SHA256_STATE_LEN];
+        char state_hex[VFS_SHA256_STATE_LEN * 2 + 1];
+        char hex[65];
+        if (vfs_sha256_stream_snapshot(&o->sha, state) != VFS_OK ||
+            vfs_sha256_stream_finalize(&o->sha, hex)   != VFS_OK) {
+            ofile_invalidate_sha(o);
+            can_hash = 0;
+        } else {
+            o->sha_live = 0;  /* finalize consumed the ctx */
+            bytes_to_hex(state, sizeof state, state_hex);
+            const char *params[6] = { size_s, mt_s, at_s, hex, state_hex, oid_hex };
+            return exec_command(pg,
+                "UPDATE objects "
+                "SET size = $1::bigint, mtime_ns = $2::bigint, "
+                "    atime_ns = $3::bigint, checksum = $4, "
+                "    checksum_state = decode($5, 'hex') "
+                "WHERE object_id = $6",
+                6, params);
+        }
+    }
+    /* sha_live was false (or finalize failed): null both columns. */
     const char *params[4] = { size_s, mt_s, at_s, oid_hex };
     return exec_command(pg,
         "UPDATE objects "
-        "SET size = $1::bigint, mtime_ns = $2::bigint, atime_ns = $3::bigint "
+        "SET size = $1::bigint, mtime_ns = $2::bigint, "
+        "    atime_ns = $3::bigint, checksum = NULL, "
+        "    checksum_state = NULL "
         "WHERE object_id = $4",
         4, params);
 }
 
 static int op_release(const char *path, struct fuse_file_info *fi) {
-    int fd = VFS_FH_FD(fi->fh);
-    trace("release %s fd=%d", path, fd);
-    if (fd > 0) close(fd);
+    struct vfs_ofile *o = VFS_OFILE(fi);
+    trace("release %s fd=%d", path, o ? o->fd : -1);
+    ofile_free(o);
+    fi->fh = 0;
     return 0;
 }
 
@@ -426,13 +569,43 @@ static int op_create(const char *path, mode_t mode, struct fuse_file_info *fi) {
         return rc;
     }
 
-    const char *oparams[5] = { id.hex, mode_s, now_s, now_s, now_s };
+    /* Initialize a SHA stream for the new empty file; its initial hex
+     * + intermediate state go straight into the row, and the same
+     * stream is kept live in the ofile for subsequent appends. */
+    vfs_sha256_stream sha = { 0 };
+    if (vfs_sha256_stream_init(&sha) != VFS_OK) {
+        exec_command(pg, "ROLLBACK", 0, NULL);
+        vfs_content_unlink(CTX.store, &id);
+        return -EIO;
+    }
+    unsigned char state_raw[VFS_SHA256_STATE_LEN];
+    char state_hex[VFS_SHA256_STATE_LEN * 2 + 1];
+    char hex[65];
+    if (vfs_sha256_stream_snapshot(&sha, state_raw) != VFS_OK ||
+        vfs_sha256_stream_peek_hex(&sha, hex)       != VFS_OK) {
+        vfs_sha256_stream_abort(&sha);
+        exec_command(pg, "ROLLBACK", 0, NULL);
+        vfs_content_unlink(CTX.store, &id);
+        return -EIO;
+    }
+    bytes_to_hex(state_raw, sizeof state_raw, state_hex);
+
+    struct fuse_context *fctx = fuse_get_context();
+    I64STR(uid_s, (int64_t)fctx->uid);
+    I64STR(gid_s, (int64_t)fctx->gid);
+
+    const char *oparams[9] = {
+        id.hex, mode_s, now_s, now_s, now_s, uid_s, gid_s, hex, state_hex
+    };
     rc = exec_command(pg,
         "INSERT INTO objects "
-        "(object_id, kind, mode, size, ctime_ns, mtime_ns, atime_ns) "
-        "VALUES ($1, 'file', $2::int, 0, $3::bigint, $4::bigint, $5::bigint)",
-        5, oparams);
+        "(object_id, kind, mode, size, ctime_ns, mtime_ns, atime_ns, "
+        " uid, gid, checksum, checksum_state) "
+        "VALUES ($1, 'file', $2::int, 0, $3::bigint, $4::bigint, "
+        "        $5::bigint, $6::int, $7::int, $8, decode($9, 'hex'))",
+        9, oparams);
     if (rc) {
+        vfs_sha256_stream_abort(&sha);
         exec_command(pg, "ROLLBACK", 0, NULL);
         vfs_content_unlink(CTX.store, &id);
         return rc;
@@ -448,12 +621,14 @@ static int op_create(const char *path, mode_t mode, struct fuse_file_info *fi) {
         "VALUES ($1, $2, $3, $4, 'file', $5, $6::bigint, $7::bigint)",
         7, mparams);
     if (rc) {
+        vfs_sha256_stream_abort(&sha);
         exec_command(pg, "ROLLBACK", 0, NULL);
         vfs_content_unlink(CTX.store, &id);
         return rc;
     }
 
     if (exec_command(pg, "COMMIT", 0, NULL)) {
+        vfs_sha256_stream_abort(&sha);
         exec_command(pg, "ROLLBACK", 0, NULL);
         vfs_content_unlink(CTX.store, &id);
         return -EIO;
@@ -466,18 +641,30 @@ static int op_create(const char *path, mode_t mode, struct fuse_file_info *fi) {
          * open it -- caller will see -EIO and `viewfs check` would
          * report any mismatch. Best to NOT unlink here lest we orphan
          * a committed mapping. */
+        vfs_sha256_stream_abort(&sha);
         return fd;
     }
-    fi->fh = (uint64_t)fd | VFS_FH_WRITE_FLAG;
+    struct vfs_ofile *o = ofile_new(fd, 1);
+    if (!o) { vfs_sha256_stream_abort(&sha); close(fd); return -ENOMEM; }
+    o->sha        = sha;     /* hand the live stream to the ofile */
+    o->sha_live   = 1;
+    o->known_size = 0;
+    fi->fh = (uint64_t)(uintptr_t)o;
     return 0;
 }
 
 static int op_truncate(const char *path, off_t off, struct fuse_file_info *fi) {
     trace("truncate %s off=%lld", path, (long long)off);
     if (CTX.read_only) return -EROFS;
-    if (fi && VFS_FH_FD(fi->fh) > 0) {
-        int fd = VFS_FH_FD(fi->fh);
-        if (ftruncate(fd, off) != 0) return -errno;
+    if (fi && fi->fh) {
+        struct vfs_ofile *o = VFS_OFILE(fi);
+        if (ftruncate(o->fd, off) != 0) return -errno;
+        /* Any truncate (grow OR shrink) invalidates the running hash:
+         * shrinking removes already-hashed bytes; growing inserts zero
+         * bytes between known_size and the new EOF that we never fed
+         * to the stream. Either way the SHA is no longer trustworthy. */
+        o->modified = 1;
+        ofile_invalidate_sha(o);
         return 0;
     }
     vfs_canon_path cp;
@@ -496,7 +683,7 @@ static int op_truncate(const char *path, off_t off, struct fuse_file_info *fi) {
     if (fd < 0) return fd;
     int rc2 = (ftruncate(fd, off) != 0) ? -errno : 0;
     if (rc2 == 0) {
-        sync_object_meta(pg, oid, fd);
+        sync_object_meta(pg, oid, NULL, fd);
         notify_parent(pg, cp.parent);
     }
     close(fd);
@@ -652,14 +839,19 @@ static int op_symlink(const char *target, const char *linkpath) {
     rc = ensure_parent_dirs_pg(pg, CTX.view_name, cp.parent);
     if (rc) { exec_command(pg, "ROLLBACK", 0, NULL); return rc; }
 
-    const char *oparams[6] = { id.hex, size_s, now_s, now_s, now_s, target };
+    struct fuse_context *fctx = fuse_get_context();
+    I64STR(uid_s, (int64_t)fctx->uid);
+    I64STR(gid_s, (int64_t)fctx->gid);
+    const char *oparams[8] = {
+        id.hex, size_s, now_s, now_s, now_s, target, uid_s, gid_s
+    };
     rc = exec_command(pg,
         "INSERT INTO objects "
         "(object_id, kind, mode, size, ctime_ns, mtime_ns, atime_ns, "
-        " symlink_target) "
+        " symlink_target, uid, gid) "
         "VALUES ($1, 'symlink', 0777, $2::bigint, $3::bigint, $4::bigint, "
-        "        $5::bigint, $6)",
-        6, oparams);
+        "        $5::bigint, $6, $7::int, $8::int)",
+        8, oparams);
     if (rc) { exec_command(pg, "ROLLBACK", 0, NULL); return rc; }
 
     const char *mparams[7] = {
@@ -897,22 +1089,64 @@ static int op_chmod(const char *path, mode_t mode, struct fuse_file_info *fi) {
 
 static int op_chown(const char *path, uid_t uid, gid_t gid,
                     struct fuse_file_info *fi) {
-    (void)uid; (void)gid; (void)fi;
-    trace("chown %s (no-op)", path);
-    /* The prototype owns everything as the daemon's user; accept and ignore. */
-    return 0;
+    (void)fi;
+    trace("chown %s uid=%u gid=%u", path, (unsigned)uid, (unsigned)gid);
+    if (CTX.read_only) return -EROFS;
+    int change_uid = (uid != (uid_t)-1);
+    int change_gid = (gid != (gid_t)-1);
+    if (!change_uid && !change_gid) return 0;  /* nothing to do */
+
+    vfs_canon_path cp;
+    int rc = canon(path, &cp);
+    if (rc) return rc;
+    if (cp.is_root) return 0;
+
+    PGconn *pg = conn_pool_get(CTX.pool);
+    if (!pg) return -EIO;
+    char kind[16], oid[VFS_OID_HEX_LEN + 1];
+    rc = lookup_mapping(pg, CTX.view_name, cp.path,
+                        kind, sizeof kind, oid, sizeof oid);
+    if (rc) return rc;
+    /* Directory mappings don't have an underlying object; chown on a
+     * directory is silently accepted but not persisted. */
+    if (!strcmp(kind, "dir") || !oid[0]) return 0;
+
+    I64STR(uid_s, (int64_t)uid);
+    I64STR(gid_s, (int64_t)gid);
+    int rc2 = 0;
+    if (change_uid && change_gid) {
+        const char *p[3] = { uid_s, gid_s, oid };
+        rc2 = exec_command(pg,
+            "UPDATE objects SET uid = $1::int, gid = $2::int "
+            "WHERE object_id = $3",
+            3, p);
+    } else if (change_uid) {
+        const char *p[2] = { uid_s, oid };
+        rc2 = exec_command(pg,
+            "UPDATE objects SET uid = $1::int WHERE object_id = $2",
+            2, p);
+    } else {
+        const char *p[2] = { gid_s, oid };
+        rc2 = exec_command(pg,
+            "UPDATE objects SET gid = $1::int WHERE object_id = $2",
+            2, p);
+    }
+    if (rc2 == 0) notify_parent(pg, cp.parent);
+    return rc2 == 0 ? 0 : -EIO;
 }
 
 static int op_flush(const char *path, struct fuse_file_info *fi) {
-    int fd = VFS_FH_FD(fi->fh);
-    int was_write = VFS_FH_IS_WRITE(fi->fh);
-    trace("flush %s fd=%d write=%d", path, fd, was_write);
+    struct vfs_ofile *o = VFS_OFILE(fi);
+    int fd        = o ? o->fd       : -1;
+    int writable  = o ? o->writable : 0;
+    int modified  = o ? o->modified : 0;
+    trace("flush %s fd=%d write=%d modified=%d", path, fd, writable, modified);
 
     /* op_flush is what close(2) synchronizes against. By doing the fsync
      * here (rather than in op_release, which is async to close), a
      * close() that returns 0 implies the bytes are durably on disk and
-     * the DB has recorded the new size. */
-    if (!was_write || fd <= 0 || !path) return 0;
+     * the DB has recorded the new size + checksum. */
+    if (!writable || !modified || fd <= 0 || !path) return 0;
 
     if (fsync(fd) != 0) return -errno;
 
@@ -925,15 +1159,21 @@ static int op_flush(const char *path, struct fuse_file_info *fi) {
                        kind, sizeof kind, oid, sizeof oid) != 0
         || strcmp(kind, "file") != 0 || !oid[0]) {
         /* mapping vanished (e.g. unlinked since open) — nothing to record */
+        o->modified = 0;
         return 0;
     }
-    if (sync_object_meta(pg, oid, fd) != 0) return -EIO;
+    if (sync_object_meta(pg, oid, o, fd) != 0) return -EIO;
     notify_parent(pg, cp.parent);
+    /* Idempotency: a second op_flush on this fd without further writes
+     * should be a no-op. The sha was consumed (sha_live=0); resetting
+     * modified prevents us from re-nulling the checksum we just set. */
+    o->modified = 0;
     return 0;
 }
 
 static int op_fsync(const char *path, int datasync, struct fuse_file_info *fi) {
-    int fd = VFS_FH_FD(fi->fh);
+    struct vfs_ofile *o = VFS_OFILE(fi);
+    int fd = o ? o->fd : -1;
     if (fd <= 0) { trace("fsync %s -> 0 (no fd)", path); return 0; }
     int rc = datasync ? fdatasync(fd) : fsync(fd);
     int ret = rc == 0 ? 0 : -errno;

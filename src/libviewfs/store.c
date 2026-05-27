@@ -77,6 +77,10 @@ static const char MIGRATION_0001[] =
     ");"
     "CREATE INDEX tags_tag ON tags (tag);";
 
+/* Keep in sync with src/libviewfs/migrations/0002_checksum_state.sql. */
+static const char MIGRATION_0002[] =
+    "ALTER TABLE objects ADD COLUMN checksum_state BYTEA;";
+
 /* ------------------------------------------------------------------
  * Common helpers
  * ------------------------------------------------------------------ */
@@ -193,6 +197,17 @@ vfs_error vfs_apply_migrations(vfs_store *s) {
         if (rc != VFS_OK) { vfs_exec_simple(s, "ROLLBACK"); return rc; }
         rc = vfs_exec_simple(s,
             "INSERT INTO schema_migrations (version) VALUES (1)");
+        if (rc != VFS_OK) { vfs_exec_simple(s, "ROLLBACK"); return rc; }
+        rc = vfs_exec_simple(s, "COMMIT");
+        if (rc != VFS_OK) return rc;
+    }
+    if (applied_v < 2) {
+        vfs_error rc = vfs_exec_simple(s, "BEGIN");
+        if (rc != VFS_OK) return rc;
+        rc = vfs_exec_simple(s, MIGRATION_0002);
+        if (rc != VFS_OK) { vfs_exec_simple(s, "ROLLBACK"); return rc; }
+        rc = vfs_exec_simple(s,
+            "INSERT INTO schema_migrations (version) VALUES (2)");
         if (rc != VFS_OK) { vfs_exec_simple(s, "ROLLBACK"); return rc; }
         rc = vfs_exec_simple(s, "COMMIT");
         if (rc != VFS_OK) return rc;
