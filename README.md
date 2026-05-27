@@ -532,4 +532,4 @@ phase-by-phase per `Plan.md` and `Design.md`.
 
 ## License
 
-To be determined.
+GNU General Public License, version 2. See [LICENSE](LICENSE) for the full text.
