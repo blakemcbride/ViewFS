@@ -1,0 +1,14 @@
+[1/3] DB integrity:
+  orphan objects (no mappings):       0
+  mappings with dangling object_id:   0
+  mappings violating dir-invariant:   0
+[2/3] Content <-> object cross-check:
+  objects with missing content file:  0
+  objects with size mismatch:         0
+  content files with no object row:   0
+[3/3] Schema version:
+  DB schema version:   1
+  Binary expects:      1
+  OK
+
+Store is consistent.
