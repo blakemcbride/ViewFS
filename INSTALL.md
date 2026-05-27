@@ -249,12 +249,11 @@ export VIEWFS_STORE="$HOME/.local/share/viewfs"
 ```
 
 Initialize that store (creates the directory and the PostgreSQL schema).
-You can either pass `--pg CONNINFO` explicitly, or set
-`VIEWFS_PG_USER` and `VIEWFS_PG_DATABASE` and let `init` pick them up:
+`init` builds its conninfo from `VIEWFS_PG_USER` (optional) and
+`VIEWFS_PG_DATABASE` (defaults to `viewfs` if unset):
 
 ```sh
 export VIEWFS_PG_USER=postgres
-export VIEWFS_PG_DATABASE=viewfs
 viewfs init "$VIEWFS_STORE"
 ```
 

@@ -20,13 +20,12 @@ For this tutorial I'll use:
 ```sh
 export VIEWFS_STORE=$HOME/tutorial-vfs
 export VIEWFS_PG_USER=postgres
-export VIEWFS_PG_DATABASE=viewfs
 ```
 
-`viewfs init` reads `VIEWFS_PG_USER` and `VIEWFS_PG_DATABASE` when `--pg`
-is not given; the host falls back to libpq's local Unix socket. If you
-need a different host, port, password, or other libpq option, pass
-`--pg CONNINFO` instead.
+`viewfs init` builds its libpq conninfo from `VIEWFS_PG_USER` (optional)
+and `VIEWFS_PG_DATABASE` (defaults to `viewfs` if unset). The host
+falls back to libpq's local Unix socket. If you need a different host,
+port, password, or other libpq option, pass `--pg CONNINFO` instead.
 
 ---
 
@@ -621,7 +620,7 @@ You can always poke at the PostgreSQL schema directly if you want to
 see what's there:
 
 ```sh
-psql -U "$VIEWFS_PG_USER" -d "$VIEWFS_PG_DATABASE" <<'SQL'
+psql -U "$VIEWFS_PG_USER" -d "${VIEWFS_PG_DATABASE:-viewfs}" <<'SQL'
 SET search_path TO viewfs;
 SELECT view_name, view_path, entry_kind FROM mappings ORDER BY view_name, view_path;
 SELECT object_id, size, kind FROM objects;
@@ -683,7 +682,7 @@ viewfs unmount ~/mnt/writing      2>/dev/null
 viewfs unmount ~/mnt/archive      2>/dev/null
 
 # Drop the PG schema (CLI doesn't currently have a dedicated command):
-psql -U "$VIEWFS_PG_USER" -d "$VIEWFS_PG_DATABASE" -c 'DROP SCHEMA IF EXISTS viewfs CASCADE'
+psql -U "$VIEWFS_PG_USER" -d "${VIEWFS_PG_DATABASE:-viewfs}" -c 'DROP SCHEMA IF EXISTS viewfs CASCADE'
 
 # Remove the backing store:
 rm -rf "$VIEWFS_STORE"

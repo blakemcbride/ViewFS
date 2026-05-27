@@ -41,9 +41,10 @@ int cmd_init(int argc, char **argv) {
 "\n"
 "  STORE_PATH    directory to hold config + content blobs\n"
 "  --pg CONNINFO libpq connection string. If omitted, the conninfo is\n"
-"                built from VIEWFS_PG_USER and VIEWFS_PG_DATABASE (each\n"
-"                optional); any field not supplied falls through to\n"
-"                libpq's PG* env vars / compiled-in defaults.\n"
+"                built from VIEWFS_PG_USER (optional) and\n"
+"                VIEWFS_PG_DATABASE (defaults to 'viewfs' if unset).\n"
+"                Anything else falls through to libpq's PG* env vars /\n"
+"                compiled-in defaults.\n"
 "  --schema NAME Postgres schema name. Defaults to 'viewfs'.\n"
 "  --reinit      allow overwriting an existing config.toml.\n");
         return 2;
@@ -58,17 +59,17 @@ int cmd_init(int argc, char **argv) {
     if (!conninfo) {
         const char *pg_user = getenv("VIEWFS_PG_USER");
         const char *pg_db   = getenv("VIEWFS_PG_DATABASE");
+        if (!pg_db || !*pg_db) pg_db = "viewfs";  /* sensible default */
         if (pg_user && *pg_user &&
             append_conn_kv(built, sizeof built, "user", pg_user) < 0) {
             fprintf(stderr, "viewfs init: VIEWFS_PG_USER too long\n");
             return 1;
         }
-        if (pg_db && *pg_db &&
-            append_conn_kv(built, sizeof built, "dbname", pg_db) < 0) {
+        if (append_conn_kv(built, sizeof built, "dbname", pg_db) < 0) {
             fprintf(stderr, "viewfs init: VIEWFS_PG_DATABASE too long\n");
             return 1;
         }
-        if (built[0]) conninfo = built;
+        conninfo = built;
     }
 
     vfs_error rc = vfs_store_create(store_path, conninfo, schema, reinit);

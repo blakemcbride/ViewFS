@@ -398,11 +398,11 @@ Notes:
 - `init` is idempotent against an existing Postgres schema
   (`IF NOT EXISTS` everywhere). It refuses to overwrite an existing
   `config.toml` unless `--reinit` is passed. `--pg` is optional; if
-  omitted, `cmd_init` synthesizes a conninfo from the `VIEWFS_PG_USER`
-  and `VIEWFS_PG_DATABASE` env vars (each optional, libpq-quoted), and
-  any remaining field falls back to libpq's `PGHOST`/`PGPORT`/`PGUSER`/
-  `PGDATABASE` env vars or compiled-in defaults at open time. If none
-  of those are set, the empty string is stored in `config.toml`.
+  omitted, `cmd_init` synthesizes a conninfo using `VIEWFS_PG_USER`
+  (optional, libpq-quoted) and `VIEWFS_PG_DATABASE` (defaults to
+  `viewfs` if unset). Any remaining field (host, port, password, ...)
+  falls back to libpq's `PGHOST`/`PGPORT`/`PGUSER` env vars or
+  compiled-in defaults at open time.
 - `object import` reads a host file, generates an object id, copies
   content into `objects/<aa>/<id>` via `tmp/` + atomic `rename`, then
   inserts the object row with that pre-allocated id via
