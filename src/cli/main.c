@@ -15,7 +15,7 @@ static void print_usage(FILE *out) {
 "  status                           show store status\n"
 "\n"
 "Views:\n"
-"  view create NAME [--description TEXT]\n"
+"  view create NAME [\"DESCRIPTION\"]\n"
 "  view list\n"
 "  view show NAME\n"
 "  view delete NAME\n"

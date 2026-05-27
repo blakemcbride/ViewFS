@@ -362,7 +362,7 @@ process, so subcommand parsers never need to know about it.
 viewfs init STORE_PATH [--pg CONNINFO] [--schema NAME] [--reinit]
 viewfs status
 
-viewfs view create NAME [--description TEXT]
+viewfs view create NAME ["DESCRIPTION"]
 viewfs view list
 viewfs view show NAME
 viewfs view delete NAME
@@ -426,7 +426,8 @@ Notes:
   in v1; Phase 6's `viewfs check --fix` will help.)
 - `viewfs find --attr KEY` (no `=VALUE`) lists every object that has any
   value for that key. `--attr KEY=VALUE` is the equality form.
-- `viewfs view create` accepts `--description TEXT`.
+- `viewfs view create` accepts an optional positional `"DESCRIPTION"`
+  after the view name.
 
 ---
 

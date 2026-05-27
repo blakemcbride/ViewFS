@@ -7,7 +7,7 @@
 static void print_usage(FILE *out) {
     fprintf(out,
 "Usage: viewfs view <subcommand> [args]\n"
-"  view create NAME [--description TEXT]\n"
+"  view create NAME [\"DESCRIPTION\"]\n"
 "  view list\n"
 "  view show NAME\n"
 "  view delete NAME\n"
@@ -33,9 +33,10 @@ static void print_mapping_row(const vfs_mapping_row *r, void *ud) {
 }
 
 static int sub_create(int argc, char **argv, vfs_store *s) {
-    const char *desc = cli_take_flag(&argc, argv, "--description", 0);
-    if (argc != 4) { return usage(); }
+    /* argv: viewfs, view, create, NAME, [DESCRIPTION] */
+    if (argc != 4 && argc != 5) { return usage(); }
     const char *name = argv[3];
+    const char *desc = (argc == 5) ? argv[4] : NULL;
     vfs_error rc = vfs_view_create(s, name, desc);
     if (rc == VFS_ERR_EXISTS) {
         fprintf(stderr, "viewfs: view '%s' already exists\n", name);

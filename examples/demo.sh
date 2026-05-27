@@ -100,8 +100,8 @@ export VIEWFS_STORE="$STORE"
 pause
 
 step "Step 2: create two views"
-"$VFS" view create programming --description 'source code'
-"$VFS" view create writing     --description 'docs and notes'
+"$VFS" view create programming 'source code'
+"$VFS" view create writing     'docs and notes'
 "$VFS" view list
 pause
 

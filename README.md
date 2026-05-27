@@ -147,8 +147,8 @@ different schema name; pass `--reinit` to overwrite an existing
 ### Creating views
 
 ```sh
-./viewfs view create programming --description 'source code'
-./viewfs view create writing     --description 'docs and notes'
+./viewfs view create programming 'source code'
+./viewfs view create writing     'docs and notes'
 ./viewfs view list
 ./viewfs view show programming
 ./viewfs view delete programming   # removes the view and all its mappings

@@ -101,7 +101,7 @@ Views are the named hierarchies your files will appear in. Start with
 one:
 
 ```sh
-viewfs view create programming --description 'source code'
+viewfs view create programming 'source code'
 viewfs view list
 ```
 
@@ -231,7 +231,7 @@ in multiple views under different paths. Create a second view and
 attach one of the existing objects to it:
 
 ```sh
-viewfs view create writing --description 'docs and notes'
+viewfs view create writing 'docs and notes'
 
 # Grab the object ID of the README we created above:
 README=$(viewfs object id programming /README.md)
