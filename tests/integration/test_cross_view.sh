@@ -1,30 +1,43 @@
 #!/usr/bin/env bash
-# T12: Writing a shared object through one view and reading the change
-#      through another view.
-
-. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
-
+# The same object is shared across views: membership is purely a function of
+# the object's properties and each directory's filter, so one object surfaces
+# in any view+dir whose filter it satisfies.
+source "$(dirname "$0")/lib.sh"
 init_store
-"$VFS" view create v1 >/dev/null
-"$VFS" view create v2 >/dev/null
 
-src="$STORE/.scratch-cross"
-echo 'before' > "$src"
-"$VFS" object import "$src" >/dev/null
-ID=$(first_object_id)
+"$VFS" view create alpha >/dev/null
+"$VFS" view create beta  >/dev/null
 
-"$VFS" view add v1 "$ID" /v1-path.txt >/dev/null
-"$VFS" view add v2 "$ID" /v2-path.txt >/dev/null
+# alpha:/by-author/blake  filters author=blake
+"$VFS" dir mkdir alpha /by-author >/dev/null
+"$VFS" dir mkdir alpha /by-author/blake >/dev/null
+"$VFS" prop set alpha:/by-author/blake author blake >/dev/null
 
-mount_view v1 "$MNT/v1"
-mount_view v2 "$MNT/v2"
+# beta:/2024 filters year=2024 (a different view, different filter)
+"$VFS" dir mkdir beta /2024 >/dev/null
+"$VFS" prop set beta:/2024 year 2024 >/dev/null
 
-# write through v1
-echo 'AFTER' > "$MNT/v1/v1-path.txt"
-sleep 0.3   # give the writing daemon time to NOTIFY + v2's daemon to invalidate
+# One object with author=blake AND year=2024 satisfies both filters.
+echo "shared" > "$STORE/s.txt"
+sid=$("$VFS" object import "$STORE/s.txt" | awk '{print $1}')
+"$VFS" prop set "$sid" author blake >/dev/null
+"$VFS" prop set "$sid" year 2024 >/dev/null
 
-through_v2=$(cat "$MNT/v2/v2-path.txt")
-assert_eq "$through_v2" 'AFTER' 'change visible through v2'
+assert_contains "$("$VFS" dir ls alpha /by-author/blake)" "s.txt" \
+    "object visible in alpha by author"
+assert_contains "$("$VFS" dir ls beta /2024)" "s.txt" \
+    "same object visible in beta by year"
 
-unmount_view "$MNT/v1"
-unmount_view "$MNT/v2"
+# An object with only author=blake is NOT in beta:/2024.
+echo "only-author" > "$STORE/o.txt"
+oid=$("$VFS" object import "$STORE/o.txt" | awk '{print $1}')
+"$VFS" prop set "$oid" author blake >/dev/null
+assert_contains     "$("$VFS" dir ls alpha /by-author/blake)" "o.txt" "o in alpha"
+assert_not_contains "$("$VFS" dir ls beta /2024)" "o.txt" "o not in beta (no year)"
+
+# Deleting the view drops its directories, not the shared object.
+"$VFS" view delete beta >/dev/null
+assert_contains "$("$VFS" dir ls alpha /by-author/blake)" "s.txt" \
+    "shared object survives deletion of the other view"
+
+echo "PASS: test_cross_view"

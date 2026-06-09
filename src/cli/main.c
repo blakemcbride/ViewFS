@@ -17,32 +17,36 @@ static void print_usage(FILE *out) {
 "Views:\n"
 "  view create NAME [\"DESCRIPTION\"]\n"
 "  view list\n"
-"  view show NAME\n"
+"  view show NAME                   list the view's directory tree\n"
 "  view delete NAME\n"
-"  view add VIEW OBJECT_ID|PREFIX VIEW_PATH\n"
-"  view remove VIEW VIEW_PATH\n"
-"  view populate VIEW --tag TAG --under VIEW_PATH\n"
+"\n"
+"Directories (per view; contents are computed from properties):\n"
+"  (inside a mounted view, VIEW/DIR may be omitted -> taken from your cwd)\n"
+"  dir mkdir [VIEW] DIR\n"
+"  dir rmdir [VIEW] DIR\n"
+"  dir ls [[VIEW] DIR]              list computed contents (dirs + files)\n"
 "\n"
 "Objects:\n"
-"  object import HOST_PATH [--into VIEW:PATH]...\n"
+"  object import HOST_PATH [--name NAME] [--into VIEW:DIR]...\n"
 "  object show ID|PREFIX\n"
-"  object paths ID|PREFIX\n"
+"  object name ID|PREFIX [NEWNAME]\n"
+"  object copy ID|PREFIX VIEW:DIR\n"
 "  object id VIEW VIEW_PATH\n"
 "  object list [--orphaned]\n"
 "  object delete ID|PREFIX\n"
 "  object delete --orphaned [--dry-run]\n"
 "\n"
-"Metadata:\n"
-"  attr set ID KEY VALUE\n"
-"  attr get ID\n"
-"  attr remove ID KEY\n"
-"  tag add ID TAG\n"
-"  tag remove ID TAG\n"
-"  tag list ID\n"
-"  find --tag TAG | --attr KEY[=VALUE]\n"
+"Properties (on a file OR a directory's membership filter; multi-valued):\n"
+"  prop set    TARGET KEY VALUE [--flow]\n"
+"  prop unset  TARGET KEY [VALUE]\n"
+"  prop list   [TARGET] [--effective]\n"
+"  find --prop KEY[=VALUE] [--prop KEY[=VALUE]]...\n"
+"  TARGET: a path/name in your mount, VIEW:DIR, an object ID, or omitted=cwd\n"
+"  (--flow/--effective apply to directory targets; a tag is key 'tag')\n"
 "\n"
 "Mounting:\n"
 "  mount NAME [--ro] [--foreground] [--verbose] MOUNTPOINT\n"
+"  mounts                           list mounted views and their mountpoints\n"
 "  unmount MOUNTPOINT\n"
 "\n"
 "Diagnostics:\n"
@@ -87,11 +91,12 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "init"))    return cmd_init   (argc, argv);
     if (!strcmp(cmd, "status"))  return cmd_status (argc, argv);
     if (!strcmp(cmd, "view"))    return cmd_view   (argc, argv);
+    if (!strcmp(cmd, "dir"))     return cmd_dir    (argc, argv);
     if (!strcmp(cmd, "object"))  return cmd_object (argc, argv);
-    if (!strcmp(cmd, "attr"))    return cmd_attr   (argc, argv);
-    if (!strcmp(cmd, "tag"))     return cmd_tag    (argc, argv);
+    if (!strcmp(cmd, "prop"))    return cmd_prop   (argc, argv);
     if (!strcmp(cmd, "find"))    return cmd_find   (argc, argv);
     if (!strcmp(cmd, "mount"))   return cmd_mount  (argc, argv);
+    if (!strcmp(cmd, "mounts"))  return cmd_mounts (argc, argv);
     if (!strcmp(cmd, "unmount")) return cmd_unmount(argc, argv);
     if (!strcmp(cmd, "check"))   return cmd_check  (argc, argv);
 

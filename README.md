@@ -1,9 +1,13 @@
 # ViewFS
 
 A Linux FUSE 3 prototype of a **view-based filesystem**: instead of a single
-fixed hierarchy, files are organized into named, task-specific *views*. The
-same file can appear in multiple views, under different paths, with different
-names — but it's the same underlying object, edited in one place.
+fixed hierarchy, files are organized into named, task-specific *views*.
+Membership is **property-driven** — each directory carries a set of
+property/value pairs, and a file appears in a directory exactly when the
+file's properties are a **superset** of that directory's effective set.
+Nothing records where a file "lives"; a directory's contents are *computed*
+from properties. The same underlying object therefore surfaces in every
+directory (and every view) whose filter it satisfies, edited in one place.
 
 **Source:** <https://github.com/blakemcbride/ViewFS>
 
@@ -17,12 +21,21 @@ names — but it's the same underlying object, edited in one place.
 ## What this prototype demonstrates
 
 - Multiple named views over a shared object pool.
-- One file object → many view paths, possibly with different names.
-- Per-view mappings persist across unmount and remount.
+- **Property-driven membership:** directories carry `(key, value)` filter
+  pairs; a file appears wherever its properties are a superset of the
+  directory's effective filter. One object surfaces in many directories and
+  views at once, with no copies and no per-file placement records.
+- **Per-property "flow":** a directory pair can be marked to cascade to
+  descendant directories, making a child a strict subset of its parent
+  (cumulative); unmarked pairs constrain only their own directory.
+- Multi-valued properties (a key may hold several values).
+- Directories and their filters persist across unmount and remount.
 - Files mounted under a view are accessed via ordinary POSIX calls
   (`open`, `read`, `write`, `readdir`, `mkdir`, `rename`, `symlink`, …).
-- Arbitrary attributes and tags on objects, with `find --tag` / `--attr`
-  queries and round-trip support through FUSE `setxattr`/`getxattr`.
+  Creating a file inside a directory gives it that directory's properties;
+  moving a file swaps the source directory's pairs for the destination's.
+- `find --prop KEY[=VALUE]` queries; object properties round-trip through
+  FUSE `setxattr`/`getxattr` under the `user.viewfs.` namespace.
 - PostgreSQL `LISTEN/NOTIFY` driven cache invalidation so changes made
   through the CLI are visible inside running mounts within milliseconds.
 - A self-diagnosing `viewfs check` that detects DB↔filesystem divergence.
@@ -41,27 +54,33 @@ names — but it's the same underlying object, edited in one place.
 
 See:
 
+- [`Rationale.md`](Rationale.md) — why this filesystem exists: the case for
+  property-driven views over the place-it-by-hand directory tree.
 - `INSTALL.md` — build, configure PostgreSQL, optional system-wide install.
-- `RUNNING.md` — guided tutorial: views, mounts, sharing, tags, xattrs, diagnostics.
-- `Design.md` — implementation design, phase by phase.
+- `RUNNING.md` — guided tutorial: views, directories, property filters,
+  mounts, sharing, xattrs, diagnostics.
+- `Plan-rewrite.md` — the property-driven model and the rewrite plan
+  (authoritative for the current behavior).
+- `Design.md` / `Plan.md` — the original explicit-mapping design and build
+  plan (historical; superseded by the property model).
 - `viewfs_fuse_prototype_spec.md` — the spec this prototype targets.
 
 ## Status
 
-Built incrementally per `Plan.md`:
+The prototype was first built explicit-mapping (one stored row per file
+placement) per `Plan.md`, then **rewritten to the property-driven model**
+described here per `Plan-rewrite.md`:
 
 | Phase | Scope | Status |
 |-------|-------|--------|
-| 0 | Project skeleton, build system | ✓ |
-| 1 | libviewfs core + CLI (no FUSE) | ✓ |
-| 2 | FUSE read path | ✓ |
-| 3 | FUSE write path | ✓ |
-| 4 | LISTEN/NOTIFY cache invalidation | ✓ |
-| 5 | Optional FUSE ops (symlinks, xattrs, populate) | ✓ |
-| 6 | `viewfs check`, diagnostics polish | ✓ |
-| 7 | Demo script + full README | ✓ |
-| 8 | Tests (alongside 1–7) | ✓ |
-| 9 | Power-loss resilience (fsync, content-before-commit) | ✓ |
+| R0 | Property schema + libviewfs (membership, effective sets, flow) | ✓ |
+| R1 | CLI (`dir`, `prop`, `find --prop`, `object copy/name`) | ✓ |
+| R2 | FUSE daemon over computed membership (read + write) | ✓ |
+| R4 | Integration suite + docs/demo rewrite | ✓ |
+| R5 | `check` invariants, name-collision disambiguation (D2) | ✓ |
+
+`Design.md` and `Plan.md` document the original explicit-mapping build; the
+authoritative description of the current model is `Plan-rewrite.md`.
 
 ## Architecture
 
@@ -109,20 +128,23 @@ The build produces two binaries in the project root:
 
 ## PostgreSQL setup
 
-You need a running local PostgreSQL with a role and database for ViewFS.
-The development setup uses the `postgres` role:
+You need a running local PostgreSQL with a role ViewFS can connect as. You do
+**not** need to create the database yourself: `viewfs init` creates it
+automatically if it is missing (it connects to the `postgres` maintenance
+database and runs `CREATE DATABASE`), as long as the role has the `CREATEDB`
+privilege. The development setup uses the superuser `postgres` role:
 
 ```sh
 sudo systemctl start postgresql
-sudo -u postgres createdb viewfs
-# pg_hba.conf trust or peer auth on local socket suffices for dev
+# pg_hba.conf trust or peer auth on the local socket suffices for dev.
+# `viewfs init` will create the `viewfs` database on first run.
 ```
 
-For a single-user setup that connects as yourself instead:
+For a single-user setup that connects as yourself instead, give your role
+`CREATEDB` (or superuser) so `init` can create the database:
 
 ```sh
-sudo -u postgres createuser -s "$USER"
-sudo -u postgres createdb -O "$USER" viewfs
+sudo -u postgres createuser -s "$USER"   # -s = superuser; or use --createdb
 ```
 
 ## Quick start
@@ -144,55 +166,124 @@ and creates the PostgreSQL `viewfs` schema with the tables defined in
 different schema name; pass `--reinit` to overwrite an existing
 `config.toml`.
 
-### Creating views
+### Creating views and directories
+
+A view is a named directory tree; each directory carries a property filter.
 
 ```sh
-./viewfs view create programming 'source code'
-./viewfs view create writing     'docs and notes'
+./viewfs view create docs 'document library'
 ./viewfs view list
-./viewfs view show programming
-./viewfs view delete programming   # removes the view and all its mappings
+./viewfs view show docs                 # prints the directory tree
+
+./viewfs dir mkdir docs /by-author
+./viewfs dir mkdir docs /by-author/blake
+./viewfs dir mkdir docs /reports/2024   # auto-creates /reports
+./viewfs view delete docs               # removes the view and its directories
 ```
 
-### Importing files
+A freshly made directory has an **empty** filter — and an empty filter is a
+subset of everything, so an empty-filter directory (including every view's
+root `/`) lists **every** object until you attach pairs to it.
+
+### Attaching property filters to directories
+
+A directory's filter is just properties on the directory, so the same
+`prop` command manages it — the **target** says whether you mean a file or a
+directory. A directory target is written `VIEW:DIR` (or a path/cwd inside a
+mount; see below).
 
 ```sh
-echo 'int main(void) { return 0; }' > /tmp/foo.c
-./viewfs object import /tmp/foo.c
+# /by-author/blake matches objects whose properties include author=blake
+./viewfs prop set docs:/by-author/blake author blake
+
+# --flow makes a pair cascade to descendant directories
+./viewfs prop set docs:/reports kind report --flow
+./viewfs prop set docs:/reports/2024 year 2024
+
+./viewfs prop list docs:/reports/2024              # own pairs only
+./viewfs prop list docs:/reports/2024 --effective  # incl. flowed ancestors
+./viewfs prop unset docs:/reports/2024 year 2024
+```
+
+With the pairs above, `/reports/2024`'s *effective* filter is
+`{kind=report, year=2024}` (its own `year` plus the flowed `kind`), so it is
+a strict subset of `/reports`.
+
+Inside a mounted view you rarely need to type `VIEW:DIR` at all — `prop` (and
+`dir mkdir`/`rmdir`/`ls`) infer the target from where you're standing:
+
+- a **directory** target can be omitted (acts on your current directory),
+  given as `.`, or given as a relative/absolute path;
+- a **file** target is just its name (or a path) in the current directory;
+- `prop` decides file-vs-directory automatically from what the path names.
+
+```sh
+cd /tmp/mnt/docs/reports
+viewfs dir mkdir 2024              # -> docs:/reports/2024 (relative path)
+viewfs prop set . kind report --flow   # set on the current directory
+cd 2024
+viewfs prop set . year 2024       # filter on the dir you're in
+viewfs prop list --effective      # this directory's effective filter
+viewfs prop set report.txt reviewed yes   # a file's property, by name
+viewfs prop list report.txt       # that file's properties
+viewfs dir ls                     # the current dir's computed contents
+```
+
+(`--flow` and `--effective` apply only to directory targets; using them on a
+file is an error. For `prop set`/`prop unset` the `TARGET` is required — use
+`.` for the current directory — while `prop list`'s target may be omitted.)
+
+### Importing files and giving them properties
+
+```sh
+echo 'Q3 revenue' > /tmp/q3.txt
+# import and assign /reports' effective pairs in one step:
+./viewfs object import /tmp/q3.txt --into docs:/reports
 ./viewfs object list
 ./viewfs object show <id|prefix>
-./viewfs object paths <id|prefix>     # every view path pointing at it
+./viewfs object name <id|prefix> q3.txt     # get/set the display name
+
+# properties drive membership; set them directly too (multi-valued).
+# the TARGET here is an object id, but it can also be a filename in a mount:
+./viewfs prop set   <id> author blake
+./viewfs prop set   <id> author jane        # same key, second value
+./viewfs prop list  <id>
+./viewfs prop unset <id> author jane        # drop one value
+./viewfs find --prop kind=report --prop year=2024   # AND across pairs
+
+# see a directory's computed contents without mounting:
+./viewfs dir ls docs /reports/2024
 ```
 
-`object import` reads a host file, copies its content into
-`$STORE/objects/<aa>/<id>` via `tmp/` + atomic `rename`, and inserts the
-object row. Object IDs are 32 hex characters; the CLI accepts any
-unambiguous prefix.
+`object import` copies content into `$STORE/objects/<aa>/<id>` via `tmp/` +
+atomic `rename` and inserts the object row; `--into VIEW:DIR` then assigns
+that directory's effective pairs so the object appears there. Object IDs are
+32 hex characters; the CLI accepts any unambiguous prefix.
 
-### Mapping objects into views
-
-```sh
-# Attach at any chosen view path; parent directories are auto-created.
-./viewfs view add programming <obj> /src/foo.c
-./viewfs view add writing     <obj> /docs/foo-notes.md
-
-# Or attach at import time:
-./viewfs object import /tmp/bar.c \
-    --into programming:/src/bar.c \
-    --into writing:/articles/bar-notes.md
-
-./viewfs view remove programming /src/foo.c   # detach (object survives)
-```
+`viewfs object copy <id> VIEW:DIR` duplicates an object's content into a new
+object that keeps the source's properties and additionally gains the
+destination directory's pairs.
 
 ### Mounting and unmounting
 
 ```sh
-mkdir -p /tmp/mnt/programming
-./viewfs mount   programming /tmp/mnt/programming
-./viewfs unmount /tmp/mnt/programming
+mkdir -p /tmp/mnt/docs
+./viewfs mount   docs /tmp/mnt/docs
+./viewfs mounts                       # list every mounted view + its mountpoint
+./viewfs unmount /tmp/mnt/docs
 ```
 
-`viewfs unmount` is a thin wrapper around `fusermount3 -u`. The
+`viewfs mounts` reads `/proc/mounts` and lists each mounted ViewFS view, its
+mode (`rw`/`ro`), and its mountpoint — for example:
+
+```text
+VIEW                 MODE   MOUNTPOINT
+docs                 rw     /tmp/mnt/docs
+archive              ro     /tmp/mnt/archive
+```
+
+It needs no `--store`/`$VIEWFS_STORE` and reports every ViewFS mount on the
+system. `viewfs unmount` is a thin wrapper around `fusermount3 -u`; the
 `fusermount3` setuid helper lives in the `fuse3` package on Fedora.
 
 Mount options:
@@ -207,34 +298,45 @@ and removes it on unmount.
 ### Reading, writing, and renaming
 
 ```sh
-cat /tmp/mnt/programming/src/foo.c          # read
-echo 'new content' > /tmp/mnt/programming/new.txt   # create + write
-mkdir /tmp/mnt/programming/sub               # mkdir
-mv /tmp/mnt/programming/new.txt /tmp/mnt/programming/sub/moved.txt  # rename
-rm /tmp/mnt/programming/sub/moved.txt        # unlink
-rmdir /tmp/mnt/programming/sub               # rmdir (errors if non-empty)
+cat /tmp/mnt/docs/reports/2024/q3.txt        # read
+echo 'idea' > /tmp/mnt/docs/by-author/blake/idea.txt  # create: gains author=blake
+mkdir /tmp/mnt/docs/sub                       # mkdir (empty filter)
+mv /tmp/mnt/docs/by-author/blake/idea.txt /tmp/mnt/docs/reports/idea.txt  # move
+rm /tmp/mnt/docs/reports/idea.txt             # unlink -> deletes the object
+rmdir /tmp/mnt/docs/sub                       # rmdir (errors if it matches files)
 ```
+
+Creating a file inside a directory automatically gives the new object that
+directory's **effective** property pairs, so it immediately appears there.
+A **move** (`mv`) keeps the same object but swaps the source directory's
+pairs for the destination's (retaining any other properties); a **copy**
+through the mount (`cp`) makes a brand-new object that takes on the
+destination directory's pairs. **`rm` deletes the object outright** — to
+remove a file from one directory without destroying it, change its
+properties instead (`viewfs prop unset`, or `mv` it elsewhere).
+
+> Two behaviors that follow directly from the model: an object appears under
+> a view's root `/` (and any other empty-filter directory) because the empty
+> filter matches everything; and a file in a child directory also appears in
+> its parent whenever the parent's pair is flowed down, since the child is
+> then a strict subset of the parent. Both are intentional.
+>
+> When two distinct objects share a display name in the same directory, the
+> mount lists each as `name~<object-id-prefix>` (e.g. `report.txt~a1f8`) so
+> they remain individually openable; a uniquely-named file is shown bare.
 
 ### How shared objects behave
 
-A single underlying object can be mapped into multiple views. Writing
-through any one mount updates the shared file:
+Membership is a pure function of an object's properties and each directory's
+filter, so one object surfaces in every directory and view it matches — no
+copies. Writing through any mount updates that one underlying object:
 
 ```sh
-./viewfs view add programming <obj> /README.md
-./viewfs view add writing     <obj> /docs/readme.md
-
-echo 'OVERWRITTEN' > /tmp/mnt/programming/README.md
-cat /tmp/mnt/writing/docs/readme.md     # -> OVERWRITTEN
-```
-
-Renaming a mapping affects only that view:
-
-```sh
-mv /tmp/mnt/programming/README.md /tmp/mnt/programming/README-renamed.md
-./viewfs object paths <obj>
-#   programming:/README-renamed.md
-#   writing:/docs/readme.md          (unchanged)
+./viewfs view create archive
+./viewfs dir mkdir archive /2024
+./viewfs prop set archive:/2024 year 2024
+# an object with year=2024 now shows in BOTH docs:/reports/2024 and
+# archive:/2024 — same object, two views, two filters.
 ```
 
 Cross-mount changes are propagated to running daemons via PostgreSQL
@@ -242,44 +344,39 @@ Cross-mount changes are propagated to running daemons via PostgreSQL
 safety net; in practice CLI mutations land in `ls` output within tens of
 milliseconds without re-mount.
 
-### Tags and attributes
+### Properties (and xattrs)
 
-Tags and attributes are object-level metadata, queryable both from the
-CLI and through FUSE extended attributes.
-
-```sh
-./viewfs tag add  <obj> project:compiler
-./viewfs tag list <obj>
-./viewfs find --tag project:compiler
-
-./viewfs attr set    <obj> language C
-./viewfs attr get    <obj>
-./viewfs attr remove <obj> language
-./viewfs find --attr language=C
-```
-
-The same `attributes` rows are exposed through FUSE under the
-`user.viewfs.` xattr namespace (everything else returns `ENOTSUP`):
+Object properties are multi-valued `(key, value)` pairs and are the sole
+driver of membership. A "tag" is just a property whose key is `tag`. The same
+`viewfs prop` command manages properties on a **file** or the filter on a
+**directory** — the `TARGET` (an object id, a `VIEW:DIR`, or a path/name in a
+mount) decides which. Properties also round-trip through FUSE extended
+attributes under the `user.viewfs.` namespace (everything else returns
+`ENOTSUP`):
 
 ```sh
-setfattr -n user.viewfs.author -v 'blake' /tmp/mnt/programming/README.md
-getfattr -d /tmp/mnt/programming/README.md
-setfattr -x user.viewfs.author /tmp/mnt/programming/README.md
+./viewfs prop set  <id> language C        # by object id
+./viewfs prop list <id>
+./viewfs find --prop language=C
+
+cd /tmp/mnt/docs/reports
+viewfs prop set  q3.txt language C         # the same file, by name in a mount
+viewfs prop list q3.txt
+
+setfattr -n user.viewfs.author -v 'blake' /tmp/mnt/docs/reports/q3.txt
+getfattr -d /tmp/mnt/docs/reports/q3.txt
+setfattr -x user.viewfs.author /tmp/mnt/docs/reports/q3.txt
 ```
 
-A batch tag-to-view operation lets you materialize a view from a tag:
-
-```sh
-./viewfs view populate archive --tag project:compiler --under /by-tag/compiler
-# adds archive:/by-tag/compiler/<basename> for every tagged object
-```
+Through FUSE an xattr is single-valued: `setxattr` replaces every value of
+the key. Use `viewfs prop set` to add multiple values for one key.
 
 ### Symbolic links
 
 ```sh
-ln -s /src/foo.c /tmp/mnt/programming/foo-link
-ls -l /tmp/mnt/programming/foo-link    # lrwxrwxrwx ... -> /src/foo.c
-readlink /tmp/mnt/programming/foo-link
+ln -s ../q3.txt /tmp/mnt/docs/reports/q3-link
+ls -l /tmp/mnt/docs/reports/q3-link
+readlink /tmp/mnt/docs/reports/q3-link
 ```
 
 Symlinks are stored as `kind='symlink'` objects with the target string
@@ -296,19 +393,24 @@ time — see [Security limitations](#security-limitations).
 ./viewfs check --fix           # remove orphan content files (only)
 ```
 
-`viewfs check` runs three phases:
+`viewfs check` runs four phases:
 
-1. **DB integrity** — orphan objects, mappings with dangling
-   `object_id`, mappings violating the `dir`-invariant CHECK.
-2. **Content ↔ object cross-check** — every object has a content file
-   of the recorded size; every content file under `objects/` has a
-   matching object row.
-3. **Schema version** — `schema_migrations.version` matches the
-   binary's expectation.
+1. **DB integrity** — objects with no properties (informational; they only
+   match empty-filter directories), directory rows whose `parent_path`
+   names a missing directory, directory rows whose `name`/`parent_path` are
+   inconsistent with `dir_path`, and `object_props` rows referencing a
+   missing object.
+2. **Content ↔ object cross-check** — every object has a content file of
+   the recorded size; every content file under `objects/` has a matching
+   object row.
+3. **Schema version** — `schema_migrations.version` matches the binary's
+   expectation.
+4. **Checksum coverage** — counts file objects with/without a stored
+   checksum; `--fill-checksums` / `--verify-checksums` populate or verify.
 
-`--fix` removes only unambiguous garbage (orphan content files with no
-DB row). It never deletes objects, mappings, or any file whose contents
-could be user data.
+`--fix` removes only unambiguous garbage (orphan content files with no DB
+row). It never deletes objects or any file whose contents could be user
+data.
 
 Per-callback FUSE tracing is enabled with `viewfs mount --verbose`;
 every callback logs its input path, intermediate state, and outcome to
@@ -316,11 +418,13 @@ stderr.
 
 ## Running the demonstration
 
-`examples/demo.sh` walks through the spec §18 demonstration end-to-end:
-initialize a fresh store, create two views, import three files, map one
-shared file into both views under different paths, mount both, modify
-through one view, verify visibility through the other, rename in one
-view, unmount/remount, and confirm mappings persist.
+`examples/demo.sh` walks through the property model end-to-end: initialize a
+fresh store, build a view with a tree of property filters (including a flowed
+pair), import files that gain those properties, show one object surfacing in
+three directories at once, query with `find --prop`, mount and browse, create
+a file inside a filter (watch it gain the directory's pairs), re-filter the
+same objects through a second view, then unmount/remount and confirm
+everything persists.
 
 ```sh
 # Interactive (pauses between each step):
@@ -358,28 +462,25 @@ make int-test      # just the integration suite
 - `test_object_id` — `vfs_object_id_generate` produces distinct 32-char
   lowercase-hex IDs; `vfs_object_id_valid` accepts those and rejects
   empty / short / 33-char / uppercase / non-hex / NULL inputs.
+- `test_props` — (DB-backed) effective property sets (independent vs
+  flowed), superset membership (multi-value AND, empty-set-matches-all),
+  name resolution + ambiguity, orphan listing, rmdir rules, and the
+  consistency-check helpers. Skips cleanly if no Postgres is reachable.
 
 ### Integration tests (`tests/integration/`)
 
-Fourteen `test_*.sh` scripts: thirteen cover all 20 numbered tests from
-spec §17, plus a Phase-9 crash-recovery test.
+Eight `test_*.sh` scripts exercise the property model end-to-end:
 
 | File | Coverage |
 |---|---|
-| `test_init.sh`        | T1  initializing a backing store |
-| `test_views.sh`       | T2 + T4  view create, add object to one view |
-| `test_import.sh`      | T3  import |
-| `test_sharing.sh`     | T5 + T6  same object → two views, different paths |
-| `test_mount_ls.sh`    | T7 + T8 + T9  mount, list visible, invisible hidden |
-| `test_read.sh`        | T10 + T11  read visible / ENOENT for missing |
-| `test_cross_view.sh`  | T12  write through one view, observed via another |
-| `test_rename.sh`      | T13  rename in one view doesn't affect others |
-| `test_unlink.sh`      | T14  unlink in one view doesn't remove object |
-| `test_persist.sh`     | T15  mappings persist across unmount + remount |
-| `test_attrs.sh`       | T16 + T19  attribute set/get + find by attribute |
-| `test_tags.sh`        | T17 + T18  tag add/list + find by tag |
-| `test_traversal.sh`   | T20  `..` traversal handled safely |
-| `test_crash.sh`       | Phase 9: kill -9 the daemon after `close(2)`, run `viewfs check` |
+| `test_init.sh`        | init + `status` + `check` on a fresh store |
+| `test_dirs_props.sh`  | views, dirs, dir-prop filters (independent vs `--flow`), object props, `find --prop`, multi-value AND, `dir ls`, rmdir rules |
+| `test_mount_read.sh`  | mounted `ls`/`cat`, empty-filter root, `--ro` enforcement |
+| `test_mount_write.sh` | create (gains dir props), `cp`, `mkdir`, `mv` (prop swap), `rm` (object deleted), persistence across remount |
+| `test_dupnames.sh`    | two objects sharing a name in one dir are shown + addressable as `name~<idprefix>` (D2) |
+| `test_cross_view.sh`  | one object shared across two views by property match; isolation |
+| `test_check.sh`       | `viewfs check` detects a deleted content file and exits non-zero |
+| `test_crash.sh`       | `kill -9` the daemon after `close(2)`; `viewfs check` consistent; bytes survive remount |
 
 Each test gets an isolated PostgreSQL schema (`viewfs_test_<pid>_<rand>`)
 and a temp store directory, both dropped on exit. `tests/integration/lib.sh`
@@ -411,37 +512,39 @@ ViewFS/
 │   │   ├── object_id.c        -- 16-byte getrandom IDs
 │   │   ├── object_store.c     -- content blob I/O (tmp+rename)
 │   │   ├── store.c            -- store lifecycle + migrations
-│   │   ├── views.c            -- views CRUD
-│   │   ├── objects.c          -- objects CRUD + prefix resolve
-│   │   ├── mappings.c         -- mappings CRUD + ensure_parent_dirs
-│   │   ├── attrs.c            -- attribute CRUD
-│   │   ├── tags.c             -- tag CRUD
-│   │   ├── find.c             -- joined queries for find --tag/--attr
+│   │   ├── views.c            -- views CRUD (root dir bootstrap)
+│   │   ├── objects.c          -- objects CRUD + name + prefix resolve
+│   │   ├── object_props.c     -- object property CRUD (multi-valued)
+│   │   ├── view_dirs.c        -- directory tree + dir-prop filters + flow
+│   │   ├── members.c          -- computed membership (superset match)
+│   │   ├── find.c             -- find by property pairs
 │   │   ├── notify.c           -- pg_notify emission helper
 │   │   └── migrations/0001_init.sql
 │   ├── cli/                   -- ./viewfs admin tool
 │   │   ├── main.c             -- subcommand dispatcher
 │   │   ├── common.{c,h}       -- store-open + flag helpers
 │   │   ├── cmd_init.c        cmd_status.c
-│   │   ├── cmd_view.c        cmd_object.c
-│   │   ├── cmd_attr.c        cmd_tag.c
+│   │   ├── cmd_view.c        cmd_dir.c
+│   │   ├── cmd_object.c      cmd_prop.c
 │   │   ├── cmd_find.c        cmd_check.c
 │   │   ├── cmd_mount.c       cmd_unmount.c
 │   └── fuse/                  -- ./viewfs-fuse daemon
 │       ├── main.c             -- argv + fuse_main
-│       ├── ops.{c,h}          -- FUSE callbacks + viewfs_ctx
+│       ├── ops.{c,h}          -- FUSE callbacks (membership) + viewfs_ctx
 │       ├── conn_pool.{c,h}    -- per-thread PGconn TLS
 │       └── notify.{c,h}       -- LISTEN thread + fuse_invalidate_path
 ├── tests/
 │   ├── unit/
 │   │   ├── test_canonicalize.c
-│   │   └── test_object_id.c
+│   │   ├── test_object_id.c
+│   │   └── test_props.c       -- DB-backed property-model tests
 │   └── integration/
 │       ├── lib.sh             -- shared helpers + per-test isolation
 │       ├── run.sh             -- runner; iterates test_*.sh
-│       └── test_*.sh          -- 13 scripts mapping to spec §17 T1–T20
+│       └── test_*.sh          -- 6 property-model end-to-end scripts
+├── Plan-rewrite.md            -- the property-model rewrite plan (authoritative)
 └── examples/
-    └── demo.sh                -- spec §18 demonstration
+    └── demo.sh                -- property-model demonstration
 ```
 
 ## Backing store layout
@@ -458,8 +561,10 @@ $STORE/
 ```
 
 PostgreSQL holds all metadata in a single configurable schema (default
-`viewfs`). See `Design.md` §3 for the canonical schema; the migration
-itself is `src/libviewfs/migrations/0001_init.sql`.
+`viewfs`): `objects` + multi-valued `object_props`, `views`, the per-view
+`view_dirs` tree, and `view_dir_props` (the per-directory filters, each pair
+carrying a `flow` flag). The canonical schema is
+`src/libviewfs/migrations/0001_init.sql`; `Plan-rewrite.md` §3 explains it.
 
 ## Durability
 
@@ -476,11 +581,11 @@ The contract as of Phase 9:
 - **`object import` is durable** once the CLI returns success. The
   helper `fsync`s the tmp file, atomic-`rename`s into the shard
   directory, then `fsync`s the shard directory itself.
-- **`op_create` creates the empty content file (and `fsync`s it and
-  the shard directory) BEFORE the metadata transaction commits.** A
-  crash between content creation and commit leaves an orphan content
-  file — `viewfs check --fix` removes those. A crash after commit
-  leaves a fully consistent new object.
+- **`op_create` inserts the object row and then creates its empty content
+  file.** A crash in that narrow window can leave a row whose content file
+  is missing; `viewfs check` reports it (`objects with missing content
+  file`). On failure to create the content file the daemon deletes the row
+  it just inserted.
 - **In-flight (unclosed) writes are not durable.** If the daemon dies
   between `write(2)` returning and `close(2)`, the data sits in the
   kernel page cache and may be lost on power loss. Since `op_flush`

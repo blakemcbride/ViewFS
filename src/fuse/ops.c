@@ -1,8 +1,10 @@
 #define _FILE_OFFSET_BITS 64
 
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/fs.h>     /* RENAME_NOREPLACE, RENAME_EXCHANGE */
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -11,6 +13,7 @@
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/types.h>
+#include <sys/xattr.h>    /* XATTR_CREATE / XATTR_REPLACE */
 #include <time.h>
 #include <unistd.h>
 
@@ -19,46 +22,26 @@
 
 viewfs_ctx CTX;
 
-/* Per-open-file state. fi->fh holds a pointer to one of these (allocated
- * in op_open / op_create, freed in op_release). The SHA-256 fields
- * implement the "incremental checksum for pure-append writes" policy:
- *
- *   sha_live=1 means the stream contains a valid running hash of the
- *   bytes currently on disk under this object id. While that's true,
- *   any op_write at offset == known_size advances the hash; any other
- *   write (out-of-order, overwrite, truncate) invalidates it, after
- *   which op_flush nulls the stored checksum + state. */
+/* The property-model membership logic lives in libviewfs and operates on a
+ * single (non-thread-safe) PGconn inside CTX.store. Rather than reimplement
+ * the relational-division membership query against the per-thread conn pool,
+ * the daemon routes all metadata through CTX.store under this mutex. Content
+ * read/write (the hot path) touch only per-open file descriptors and never
+ * take the lock. For a single-host prototype this trades some metadata
+ * concurrency for one source of truth. */
+static pthread_mutex_t g_db = PTHREAD_MUTEX_INITIALIZER;
+#define LOCK()   pthread_mutex_lock(&g_db)
+#define UNLOCK() pthread_mutex_unlock(&g_db)
+
+/* Per-open-file state; fi->fh holds a pointer to one of these. */
 struct vfs_ofile {
-    int               fd;
-    int               writable;     /* opened with non-O_RDONLY */
-    int               modified;     /* >=1 successful op_write or truncate */
-    int               sha_live;     /* SHA state tracks current on-disk bytes */
-    int64_t           known_size;   /* file size that the SHA covers */
-    vfs_sha256_stream sha;
+    int            fd;
+    int            writable;
+    int            modified;          /* >=1 write/truncate since open */
+    vfs_object_id  id;                /* the backing object */
+    char           parent[VFS_PATH_MAX];  /* parent dir, for NOTIFY */
 };
 #define VFS_OFILE(fi)  ((struct vfs_ofile *)(uintptr_t)(fi)->fh)
-
-static struct vfs_ofile *ofile_new(int fd, int writable) {
-    struct vfs_ofile *o = calloc(1, sizeof *o);
-    if (!o) return NULL;
-    o->fd       = fd;
-    o->writable = writable;
-    return o;
-}
-
-static void ofile_free(struct vfs_ofile *o) {
-    if (!o) return;
-    if (o->sha_live) vfs_sha256_stream_abort(&o->sha);
-    if (o->fd > 0)   close(o->fd);
-    free(o);
-}
-
-static void ofile_invalidate_sha(struct vfs_ofile *o) {
-    if (o->sha_live) {
-        vfs_sha256_stream_abort(&o->sha);
-        o->sha_live = 0;
-    }
-}
 
 static void trace(const char *fmt, ...) {
     if (!CTX.verbose) return;
@@ -72,8 +55,7 @@ static void trace(const char *fmt, ...) {
 
 /* Canonicalize a FUSE-supplied path into cp, returning -errno on bad input. */
 static int canon(const char *in, vfs_canon_path *out) {
-    vfs_error rc = vfs_path_canonicalize(in, out);
-    switch (rc) {
+    switch (vfs_path_canonicalize(in, out)) {
     case VFS_OK:                return 0;
     case VFS_ERR_PATH_RELATIVE: return -EINVAL;
     case VFS_ERR_PATH_ESCAPE:   return -EACCES;
@@ -82,9 +64,12 @@ static int canon(const char *in, vfs_canon_path *out) {
     }
 }
 
-/* ------------------------------------------------------------------
- * stat fillers
- * ------------------------------------------------------------------ */
+/* The parent directory used for membership/NOTIFY: "" -> "/". */
+static const char *parent_dir(const vfs_canon_path *cp) {
+    return cp->parent[0] ? cp->parent : "/";
+}
+
+/* ------------------------------------------------------------------ */
 
 static void fill_dir_stat(struct stat *st, int mode, int64_t mtime_ns) {
     memset(st, 0, sizeof *st);
@@ -98,165 +83,101 @@ static void fill_dir_stat(struct stat *st, int mode, int64_t mtime_ns) {
     st->st_ctim  = st->st_atim;
 }
 
-static void fill_file_stat(struct stat *st, int mode, int64_t size,
-                           int uid, int gid,
-                           int64_t ctime_ns, int64_t mtime_ns, int64_t atime_ns) {
+static void fill_obj_stat(struct stat *st, const vfs_object_info *o) {
     memset(st, 0, sizeof *st);
-    st->st_mode  = S_IFREG | (mode_t)(mode & 07777);
+    int is_link = o->kind && !strcmp(o->kind, "symlink");
+    st->st_mode  = (is_link ? S_IFLNK : S_IFREG) | (mode_t)(o->mode & 07777);
     st->st_nlink = 1;
-    st->st_uid   = (uid >= 0) ? (uid_t)uid : getuid();
-    st->st_gid   = (gid >= 0) ? (gid_t)gid : getgid();
-    st->st_size  = size;
-    st->st_blocks = (size + 511) / 512;
-    st->st_ctim.tv_sec  = ctime_ns / 1000000000;
-    st->st_ctim.tv_nsec = ctime_ns % 1000000000;
-    st->st_mtim.tv_sec  = mtime_ns / 1000000000;
-    st->st_mtim.tv_nsec = mtime_ns % 1000000000;
-    st->st_atim.tv_sec  = atime_ns / 1000000000;
-    st->st_atim.tv_nsec = atime_ns % 1000000000;
+    st->st_uid   = (o->uid >= 0) ? (uid_t)o->uid : getuid();
+    st->st_gid   = (o->gid >= 0) ? (gid_t)o->gid : getgid();
+    st->st_size  = o->size;
+    st->st_blocks = (o->size + 511) / 512;
+    st->st_ctim.tv_sec  = o->ctime_ns / 1000000000;
+    st->st_ctim.tv_nsec = o->ctime_ns % 1000000000;
+    st->st_mtim.tv_sec  = o->mtime_ns / 1000000000;
+    st->st_mtim.tv_nsec = o->mtime_ns % 1000000000;
+    st->st_atim.tv_sec  = o->atime_ns / 1000000000;
+    st->st_atim.tv_nsec = o->atime_ns % 1000000000;
+}
+
+/* Match an object-id prefix among same-named members (D2 disambiguation). */
+struct idprefix_match { const char *prefix; vfs_object_id id; int count; };
+static void idprefix_cb(const vfs_object_info *o, void *ud) {
+    struct idprefix_match *m = ud;
+    size_t pl = strlen(m->prefix);
+    if (strncmp(o->id.hex, m->prefix, pl) == 0) { m->id = o->id; m->count++; }
+}
+
+/* Resolve a member of `parent` named `name`, transparently handling the
+ * "name~<idprefix>" form that readdir emits for same-named objects (D2).
+ * Caller holds the lock. Returns 0 + *id, or -errno. */
+static int resolve_member(const char *parent, const char *name,
+                          vfs_object_id *id) {
+    vfs_error e = vfs_dir_member_by_name(CTX.store, CTX.view_name, parent, name, id);
+    if (e == VFS_OK) return 0;                       /* exact, unique */
+    if (e != VFS_ERR_NOTFOUND && e != VFS_ERR_AMBIGUOUS) return -EIO;
+
+    /* Try to parse a "base~hexprefix" disambiguated name. */
+    const char *tilde = strrchr(name, '~');
+    if (!tilde || tilde == name || !tilde[1])
+        return (e == VFS_ERR_AMBIGUOUS) ? -EIO : -ENOENT;
+    for (const char *p = tilde + 1; *p; p++)
+        if (!isxdigit((unsigned char)*p))
+            return (e == VFS_ERR_AMBIGUOUS) ? -EIO : -ENOENT;
+    size_t blen = (size_t)(tilde - name);
+    if (blen > VFS_NAME_MAX) return -ENOENT;
+    char base[VFS_NAME_MAX + 1];
+    memcpy(base, name, blen); base[blen] = '\0';
+
+    struct idprefix_match m = { .prefix = tilde + 1, .count = 0 };
+    if (vfs_dir_members_named(CTX.store, CTX.view_name, parent, base,
+                              idprefix_cb, &m) != VFS_OK) return -EIO;
+    if (m.count == 1) { *id = m.id; return 0; }
+    return -ENOENT;
+}
+
+/* Resolve a non-root canonical path to a file/symlink object. Must hold the
+ * lock. Returns 0 + *id, or -errno. (-EISDIR if it names a directory.) */
+static int resolve_file(const vfs_canon_path *cp, vfs_object_id *id) {
+    int isdir = 0;
+    if (vfs_dir_exists(CTX.store, CTX.view_name, cp->path, &isdir) != VFS_OK)
+        return -EIO;
+    if (isdir) return -EISDIR;
+    return resolve_member(parent_dir(cp), cp->name, id);
+}
+
+/* Apply (add=1) or remove (add=0) a directory's effective property pairs
+ * to/from an object. Must hold the lock. */
+struct prop_apply { vfs_object_id id; int add; int failed; };
+static void prop_apply_cb(const vfs_dirprop_row *p, void *ud) {
+    struct prop_apply *a = ud;
+    vfs_error e = a->add
+        ? vfs_object_prop_add  (CTX.store, &a->id, p->key, p->value)
+        : vfs_object_prop_unset(CTX.store, &a->id, p->key, p->value);
+    if (e != VFS_OK && !(!a->add && e == VFS_ERR_NOTFOUND)) a->failed++;
+}
+static int apply_dir_props(const char *dir, const vfs_object_id *id, int add) {
+    struct prop_apply a = { .id = *id, .add = add, .failed = 0 };
+    if (vfs_dir_prop_list(CTX.store, CTX.view_name, dir, 1, prop_apply_cb, &a)
+        != VFS_OK) return -EIO;
+    return a.failed ? -EIO : 0;
+}
+
+/* Ensure a directory exists (mkdir -p), tolerating "already exists". Must
+ * hold the lock. */
+static int ensure_dir(const char *dir) {
+    vfs_error e = vfs_dir_create(CTX.store, CTX.view_name, dir, 0755);
+    if (e == VFS_OK || e == VFS_ERR_EXISTS) return 0;
+    if (e == VFS_ERR_NOTFOUND) return -ENOENT;   /* view gone */
+    return -EIO;
+}
+
+static void notify(const char *parent) {
+    vfs_notify_path(CTX.store, CTX.view_name, parent ? parent : "");
 }
 
 /* ------------------------------------------------------------------
- * tiny DB helpers (every callback runs on a worker thread, gets its own
- * PGconn from the pool, and issues PQexecParams directly).
- * ------------------------------------------------------------------ */
-
-/* Execute a query that returns no rows. Returns 0 or -EIO. */
-static int exec_command(PGconn *pg, const char *sql,
-                        int nparams, const char *const *params) {
-    PGresult *r = PQexecParams(pg, sql, nparams, NULL, params, NULL, NULL, 0);
-    int ok = (PQresultStatus(r) == PGRES_COMMAND_OK);
-    if (!ok) trace("sql: %s", PQresultErrorMessage(r));
-    PQclear(r);
-    return ok ? 0 : -EIO;
-}
-
-/* Emit a NOTIFY for a parent path change. Used by every mutation path
- * inside the daemon (CLI-side mutations go through libviewfs's
- * vfs_notify_path). Failures are non-fatal: the 2-second timeout in the
- * kernel will eventually catch up. */
-static void notify_parent(PGconn *pg, const char *parent_path) {
-    char payload[VFS_PATH_MAX + 256];
-    int n = snprintf(payload, sizeof payload, "%s\t%s",
-                     CTX.view_name, parent_path ? parent_path : "");
-    if (n < 0 || (size_t)n >= sizeof payload) return;
-    const char *params[2] = { "viewfs_change", payload };
-    PGresult *r = PQexecParams(pg, "SELECT pg_notify($1, $2)",
-                               2, NULL, params, NULL, NULL, 0);
-    PQclear(r);
-}
-
-/* Convenience snprintf for an int64_t into a small stack buffer. */
-#define I64STR(name, val) char name[24]; snprintf(name, sizeof name, "%lld", (long long)(val))
-
-/* Walk parent_path components and INSERT IF NOT EXISTS each prefix as
- * an explicit directory mapping. parent_path may be "" (root). */
-static int ensure_parent_dirs_pg(PGconn *pg, const char *view,
-                                 const char *parent_path) {
-    if (!parent_path[0]) return 0;
-
-    const char *p = parent_path + 1;  /* skip leading '/' */
-    char accum[VFS_PATH_MAX];
-    size_t alen = 0;
-    int64_t now = vfs_now_ns();
-    I64STR(now_s, now);
-
-    while (1) {
-        const char *slash = strchr(p, '/');
-        size_t seglen = slash ? (size_t)(slash - p) : strlen(p);
-        if (alen + 1 + seglen >= sizeof accum) return -EINVAL;
-        accum[alen++] = '/';
-        memcpy(accum + alen, p, seglen);
-        alen += seglen;
-        accum[alen] = '\0';
-
-        const char *last_slash = strrchr(accum, '/');
-        const char *parent_str = "";
-        char parent_buf[VFS_PATH_MAX];
-        if (last_slash && last_slash != accum) {
-            size_t pl = (size_t)(last_slash - accum);
-            memcpy(parent_buf, accum, pl);
-            parent_buf[pl] = '\0';
-            parent_str = parent_buf;
-        }
-        const char *name_str = last_slash ? last_slash + 1 : accum;
-
-        const char *params[6] = { view, accum, parent_str, name_str, now_s, now_s };
-        int rc = exec_command(pg,
-            "INSERT INTO mappings "
-            "(view_name, view_path, parent_path, name, entry_kind, object_id, "
-            " ctime_ns, mtime_ns) "
-            "VALUES ($1, $2, $3, $4, 'dir', NULL, $5::bigint, $6::bigint) "
-            "ON CONFLICT (view_name, view_path) DO NOTHING",
-            6, params);
-        if (rc != 0) return rc;
-
-        if (!slash) break;
-        p = slash + 1;
-        if (!*p) break;
-    }
-    return 0;
-}
-
-/* Try to load the persisted SHA-256 intermediate state for an object
- * into the given ofile and mark it sha_live, but only if the DB's
- * recorded size matches the current host-fd size — otherwise the state
- * doesn't match the bytes we'd be about to append to. */
-static void try_load_checksum_state(PGconn *pg, const char *oid_hex,
-                                    struct vfs_ofile *o) {
-    struct stat st;
-    if (fstat(o->fd, &st) != 0) return;
-    const char *params[1] = { oid_hex };
-    PGresult *r = PQexecParams(pg,
-        "SELECT size, encode(checksum_state, 'hex') "
-        "FROM objects WHERE object_id = $1",
-        1, NULL, params, NULL, NULL, 0);
-    if (PQresultStatus(r) != PGRES_TUPLES_OK) { PQclear(r); return; }
-    if (PQntuples(r) != 1)                    { PQclear(r); return; }
-    if (PQgetisnull(r, 0, 1))                 { PQclear(r); return; }
-    int64_t db_size  = atoll(PQgetvalue(r, 0, 0));
-    if (db_size != (int64_t)st.st_size)       { PQclear(r); return; }
-
-    const char *hex = PQgetvalue(r, 0, 1);
-    size_t hex_len = strlen(hex);
-    if (hex_len != VFS_SHA256_STATE_LEN * 2)  { PQclear(r); return; }
-
-    unsigned char raw[VFS_SHA256_STATE_LEN];
-    for (size_t i = 0; i < VFS_SHA256_STATE_LEN; i++) {
-        unsigned hi = hex[2*i], lo = hex[2*i + 1];
-        hi = (hi >= 'a') ? (hi - 'a' + 10) : (hi - '0');
-        lo = (lo >= 'a') ? (lo - 'a' + 10) : (lo - '0');
-        raw[i] = (unsigned char)((hi << 4) | lo);
-    }
-    PQclear(r);
-
-    memset(&o->sha, 0, sizeof o->sha);
-    if (vfs_sha256_stream_restore(&o->sha, raw, sizeof raw) != VFS_OK) return;
-    o->sha_live   = 1;
-    o->known_size = db_size;
-}
-
-/* Look up a mapping by path. Returns 0 on hit, -ENOENT, -EIO, etc.
- * On hit, fills out_kind ("file"/"dir"/"symlink") and out_obj_id_hex
- * (empty for dirs). */
-static int lookup_mapping(PGconn *pg, const char *view, const char *vpath,
-                          char *out_kind, size_t kind_sz,
-                          char *out_obj_id, size_t obj_id_sz) {
-    const char *params[2] = { view, vpath };
-    PGresult *r = PQexecParams(pg,
-        "SELECT entry_kind, COALESCE(object_id, '') "
-        "FROM mappings WHERE view_name = $1 AND view_path = $2",
-        2, NULL, params, NULL, NULL, 0);
-    if (PQresultStatus(r) != PGRES_TUPLES_OK) { PQclear(r); return -EIO; }
-    if (PQntuples(r) == 0) { PQclear(r); return -ENOENT; }
-    snprintf(out_kind, kind_sz, "%s", PQgetvalue(r, 0, 0));
-    snprintf(out_obj_id, obj_id_sz, "%s", PQgetvalue(r, 0, 1));
-    PQclear(r);
-    return 0;
-}
-
-/* ------------------------------------------------------------------
- * getattr / readdir / open / read / release
+ * getattr / readdir
  * ------------------------------------------------------------------ */
 
 static int op_getattr(const char *path, struct stat *st,
@@ -266,69 +187,68 @@ static int op_getattr(const char *path, struct stat *st,
     vfs_canon_path cp;
     int rc = canon(path, &cp);
     if (rc) return rc;
-    if (cp.is_root) {
-        fill_dir_stat(st, 0755, vfs_now_ns());
+
+    LOCK();
+    vfs_dir_row d;
+    if (vfs_dir_get(CTX.store, CTX.view_name, cp.path, &d) == VFS_OK) {
+        fill_dir_stat(st, d.mode, d.mtime_ns);
+        UNLOCK();
         return 0;
     }
-    PGconn *pg = conn_pool_get(CTX.pool);
-    if (!pg) return -EIO;
+    if (cp.is_root) { UNLOCK(); return -ENOENT; }
+    vfs_object_id id;
+    rc = resolve_file(&cp, &id);
+    if (rc == -EISDIR) rc = 0;   /* shouldn't happen: dir_get already covered */
+    if (rc) { UNLOCK(); return rc; }
+    vfs_object_info info;
+    if (vfs_object_get(CTX.store, &id, &info) != VFS_OK) { UNLOCK(); return -EIO; }
+    fill_obj_stat(st, &info);
+    UNLOCK();
+    return 0;
+}
 
-    const char *params[2] = { CTX.view_name, cp.path };
-    PGresult *r = PQexecParams(pg,
-        "SELECT m.entry_kind, m.mode_override, m.mtime_ns, "
-        "       o.size, o.mode, o.ctime_ns, o.mtime_ns, o.atime_ns, "
-        "       o.uid, o.gid "
-        "FROM mappings m "
-        "LEFT JOIN objects o ON o.object_id = m.object_id "
-        "WHERE m.view_name = $1 AND m.view_path = $2",
-        2, NULL, params, NULL, NULL, 0);
-    if (PQresultStatus(r) != PGRES_TUPLES_OK) {
-        trace("getattr SQL: %s", PQresultErrorMessage(r));
-        PQclear(r);
-        return -EIO;
-    }
-    if (PQntuples(r) == 0) { PQclear(r); return -ENOENT; }
+/* readdir collects child-dir names and matching object names first, then
+ * emits them — disambiguating same-named objects (and objects that clash
+ * with a child-dir name) by appending "~<object-id-prefix>" (D2). */
+struct dname { char name[VFS_NAME_MAX + 1]; };
+struct dlist { struct dname *v; int n, cap, oom; };
+struct ment  { char name[VFS_NAME_MAX + 1]; char id[VFS_OID_HEX_LEN + 1]; };
+struct mlist { struct ment *v; int n, cap, oom; };
 
-    const char *kind = PQgetvalue(r, 0, 0);
-    int uid = PQgetisnull(r, 0, 8) ? -1 : atoi(PQgetvalue(r, 0, 8));
-    int gid = PQgetisnull(r, 0, 9) ? -1 : atoi(PQgetvalue(r, 0, 9));
-    if (!strcmp(kind, "dir")) {
-        int mode = PQgetisnull(r, 0, 1) ? 0 : atoi(PQgetvalue(r, 0, 1));
-        int64_t mt = atoll(PQgetvalue(r, 0, 2));
-        fill_dir_stat(st, mode, mt);
-    } else if (!strcmp(kind, "file")) {
-        int64_t size = atoll(PQgetvalue(r, 0, 3));
-        int     mode = atoi (PQgetvalue(r, 0, 4));
-        int64_t ctime_ns = atoll(PQgetvalue(r, 0, 5));
-        int64_t mtime_ns = atoll(PQgetvalue(r, 0, 6));
-        int64_t atime_ns = atoll(PQgetvalue(r, 0, 7));
-        fill_file_stat(st, mode, size, uid, gid, ctime_ns, mtime_ns, atime_ns);
-    } else if (!strcmp(kind, "symlink")) {
-        /* Symlink. Re-query the object row for the target so we can fill
-         * st_size with strlen(target) -- ls -l displays this and some
-         * tools depend on it. */
-        memset(st, 0, sizeof *st);
-        st->st_mode  = S_IFLNK | 0777;
-        st->st_nlink = 1;
-        st->st_uid   = (uid >= 0) ? (uid_t)uid : getuid();
-        st->st_gid   = (gid >= 0) ? (gid_t)gid : getgid();
-        int64_t ctime_ns = atoll(PQgetvalue(r, 0, 5));
-        int64_t mtime_ns = atoll(PQgetvalue(r, 0, 6));
-        int64_t atime_ns = atoll(PQgetvalue(r, 0, 7));
-        st->st_ctim.tv_sec  = ctime_ns / 1000000000;
-        st->st_ctim.tv_nsec = ctime_ns % 1000000000;
-        st->st_mtim.tv_sec  = mtime_ns / 1000000000;
-        st->st_mtim.tv_nsec = mtime_ns % 1000000000;
-        st->st_atim.tv_sec  = atime_ns / 1000000000;
-        st->st_atim.tv_nsec = atime_ns % 1000000000;
-        st->st_size = atoll(PQgetvalue(r, 0, 3));  /* persisted size of target */
-        PQclear(r);
-        return 0;
-    } else {
-        PQclear(r);
-        return -ENOENT;
+static void dlist_push(struct dlist *l, const char *name) {
+    if (l->n == l->cap) {
+        int nc = l->cap ? l->cap * 2 : 32;
+        void *p = realloc(l->v, (size_t)nc * sizeof *l->v);
+        if (!p) { l->oom = 1; return; }
+        l->v = p; l->cap = nc;
     }
-    PQclear(r);
+    snprintf(l->v[l->n++].name, sizeof l->v[0].name, "%s", name);
+}
+static void mlist_push(struct mlist *l, const char *name, const char *id) {
+    if (l->n == l->cap) {
+        int nc = l->cap ? l->cap * 2 : 64;
+        void *p = realloc(l->v, (size_t)nc * sizeof *l->v);
+        if (!p) { l->oom = 1; return; }
+        l->v = p; l->cap = nc;
+    }
+    snprintf(l->v[l->n].name, sizeof l->v[0].name, "%s", name);
+    snprintf(l->v[l->n].id,   sizeof l->v[0].id,   "%s", id);
+    l->n++;
+}
+static void dcb(const vfs_dir_row *d, void *ud) { dlist_push(ud, d->name); }
+static void mcb(const vfs_object_info *o, void *ud) {
+    mlist_push(ud, o->name[0] ? o->name : o->id.hex, o->id.hex);
+}
+static int ment_cmp(const void *a, const void *b) {
+    const struct ment *x = a, *y = b;
+    int c = strcmp(x->name, y->name);
+    return c ? c : strcmp(x->id, y->id);
+}
+static int common_prefix_len(const char *a, const char *b) {
+    int i = 0; while (a[i] && a[i] == b[i]) i++; return i;
+}
+static int dlist_has(const struct dlist *l, const char *name) {
+    for (int i = 0; i < l->n; i++) if (!strcmp(l->v[i].name, name)) return 1;
     return 0;
 }
 
@@ -341,47 +261,73 @@ static int op_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
     int rc = canon(path, &cp);
     if (rc) return rc;
 
-    const char *parent_q;
-    if (cp.is_root) {
-        parent_q = "";
-    } else {
-        char kind[16], oid[VFS_OID_HEX_LEN + 1];
-        PGconn *pg = conn_pool_get(CTX.pool);
-        if (!pg) return -EIO;
-        rc = lookup_mapping(pg, CTX.view_name, cp.path,
-                            kind, sizeof kind, oid, sizeof oid);
-        if (rc) return rc;
-        if (strcmp(kind, "dir") != 0) return -ENOTDIR;
-        parent_q = cp.path;
+    struct dlist dl = {0};
+    struct mlist ml = {0};
+    LOCK();
+    int isdir = 0;
+    if (vfs_dir_exists(CTX.store, CTX.view_name, cp.path, &isdir) != VFS_OK) {
+        UNLOCK(); return -EIO;
     }
+    if (!isdir) { UNLOCK(); return -ENOTDIR; }
+    vfs_error e = vfs_dir_list_children(CTX.store, CTX.view_name, cp.path, dcb, &dl);
+    if (e == VFS_OK)
+        e = vfs_dir_members(CTX.store, CTX.view_name, cp.path, mcb, &ml);
+    UNLOCK();
+    if (e != VFS_OK || dl.oom || ml.oom) { free(dl.v); free(ml.v); return -EIO; }
 
     filler(buf, ".",  NULL, 0, 0);
     filler(buf, "..", NULL, 0, 0);
+    for (int i = 0; i < dl.n; i++) filler(buf, dl.v[i].name, NULL, 0, 0);
 
-    PGconn *pg = conn_pool_get(CTX.pool);
-    if (!pg) return -EIO;
-    const char *params[2] = { CTX.view_name, parent_q };
-    PGresult *r = PQexecParams(pg,
-        "SELECT name FROM mappings "
-        "WHERE view_name = $1 AND parent_path = $2 ORDER BY name",
-        2, NULL, params, NULL, NULL, 0);
-    if (PQresultStatus(r) != PGRES_TUPLES_OK) { PQclear(r); return -EIO; }
-    int n = PQntuples(r);
-    for (int i = 0; i < n; i++) {
-        filler(buf, PQgetvalue(r, i, 0), NULL, 0, 0);
+    qsort(ml.v, (size_t)ml.n, sizeof *ml.v, ment_cmp);
+    int i = 0;
+    while (i < ml.n) {
+        int j = i;
+        while (j < ml.n && !strcmp(ml.v[j].name, ml.v[i].name)) j++;
+        int gs = j - i;
+        if (gs == 1 && !dlist_has(&dl, ml.v[i].name)) {
+            filler(buf, ml.v[i].name, NULL, 0, 0);
+        } else {
+            /* collision: same name repeated, or clashes with a child dir.
+             * Pick a uniquifying id-prefix length for the group. */
+            int maxc = 0;
+            for (int k = i + 1; k < j; k++) {
+                int c = common_prefix_len(ml.v[k-1].id, ml.v[k].id);
+                if (c > maxc) maxc = c;
+            }
+            int L = (gs == 1) ? 4 : maxc + 1;
+            if (L < 4) L = 4;
+            if (L > VFS_OID_HEX_LEN) L = VFS_OID_HEX_LEN;
+            for (int k = i; k < j; k++) {
+                char disp[VFS_NAME_MAX + 2 + VFS_OID_HEX_LEN];
+                snprintf(disp, sizeof disp, "%s~%.*s", ml.v[k].name, L, ml.v[k].id);
+                filler(buf, disp, NULL, 0, 0);
+            }
+        }
+        i = j;
     }
-    PQclear(r);
+    free(dl.v); free(ml.v);
     return 0;
 }
 
-/* Open the content file for an existing file mapping. Caller has already
- * looked up object id. Returns the host fd or -errno. */
+/* ------------------------------------------------------------------
+ * open / read / write / truncate / flush / fsync / release
+ * ------------------------------------------------------------------ */
+
 static int open_content_file(const vfs_object_id *id, int flags) {
-    char path[VFS_PATH_MAX];
-    if (vfs_content_path(CTX.store, id, path, sizeof path) != VFS_OK)
-        return -EIO;
-    int fd = open(path, flags | O_CLOEXEC);
+    char p[VFS_PATH_MAX];
+    if (vfs_content_path(CTX.store, id, p, sizeof p) != VFS_OK) return -EIO;
+    int fd = open(p, flags | O_CLOEXEC);
     return (fd < 0) ? -errno : fd;
+}
+
+static struct vfs_ofile *ofile_new(int fd, int writable,
+                                   const vfs_object_id *id, const char *parent) {
+    struct vfs_ofile *o = calloc(1, sizeof *o);
+    if (!o) return NULL;
+    o->fd = fd; o->writable = writable; o->id = *id;
+    snprintf(o->parent, sizeof o->parent, "%s", parent);
+    return o;
 }
 
 static int op_open(const char *path, struct fuse_file_info *fi) {
@@ -394,138 +340,89 @@ static int op_open(const char *path, struct fuse_file_info *fi) {
     int rc = canon(path, &cp);
     if (rc) return rc;
 
-    PGconn *pg = conn_pool_get(CTX.pool);
-    if (!pg) return -EIO;
-    char kind[16], oid[VFS_OID_HEX_LEN + 1];
-    rc = lookup_mapping(pg, CTX.view_name, cp.path,
-                        kind, sizeof kind, oid, sizeof oid);
-    if (rc) return rc;
-    if (!strcmp(kind, "dir"))  return -EISDIR;
-    if (strcmp(kind, "file"))  return -EINVAL;
-
+    LOCK();
     vfs_object_id id;
-    snprintf(id.hex, sizeof id.hex, "%s", oid);
+    rc = resolve_file(&cp, &id);
+    UNLOCK();
+    if (rc) return rc;
 
-    /* Host open flags = caller's flags, but never O_CREAT/O_EXCL because the
-     * file already exists in our store. O_TRUNC and O_APPEND are honored. */
     int host_flags = acc;
     if (fi->flags & O_TRUNC)  host_flags |= O_TRUNC;
     if (fi->flags & O_APPEND) host_flags |= O_APPEND;
-
     int fd = open_content_file(&id, host_flags);
     if (fd < 0) return fd;
 
-    struct vfs_ofile *o = ofile_new(fd, wants_write);
+    struct vfs_ofile *o = ofile_new(fd, wants_write, &id, parent_dir(&cp));
     if (!o) { close(fd); return -ENOMEM; }
-    /* For an existing file opened for writing, try to resume the
-     * checksum stream from the DB. If the stored state's size doesn't
-     * match the current on-disk size (or there's no state), sha_live
-     * stays 0 and any write will null the checksum on close. */
-    if (wants_write && !(fi->flags & O_TRUNC)) {
-        try_load_checksum_state(pg, id.hex, o);
-    }
+    if (wants_write && (fi->flags & O_TRUNC)) o->modified = 1;
     fi->fh = (uint64_t)(uintptr_t)o;
     return 0;
 }
 
 static int op_read(const char *path, char *buf, size_t size, off_t off,
                    struct fuse_file_info *fi) {
+    (void)path;
     int fd = VFS_OFILE(fi)->fd;
     ssize_t n;
-    do { n = pread(fd, buf, size, off); }
-    while (n < 0 && errno == EINTR);
-    int rc = (n < 0) ? -errno : (int)n;
-    trace("read %s sz=%zu off=%lld -> %d", path, size, (long long)off, rc);
-    return rc;
+    do { n = pread(fd, buf, size, off); } while (n < 0 && errno == EINTR);
+    return (n < 0) ? -errno : (int)n;
 }
 
 static int op_write(const char *path, const char *buf, size_t size, off_t off,
                     struct fuse_file_info *fi) {
+    (void)path;
     struct vfs_ofile *o = VFS_OFILE(fi);
     ssize_t n;
-    do { n = pwrite(o->fd, buf, size, off); }
-    while (n < 0 && errno == EINTR);
-    if (n > 0) {
-        o->modified = 1;
-        if (o->sha_live && (int64_t)off == o->known_size) {
-            /* Pure append: extend the running hash in place. */
-            if (vfs_sha256_stream_update(&o->sha, buf, (size_t)n) == VFS_OK) {
-                o->known_size += n;
-            } else {
-                ofile_invalidate_sha(o);
-            }
-        } else if (o->sha_live) {
-            /* Out-of-order or overwrite: hash state is no longer valid
-             * for whatever the file content will end up being. */
-            ofile_invalidate_sha(o);
-        }
-    }
-    int rc = (n < 0) ? -errno : (int)n;
-    trace("write %s sz=%zu off=%lld -> %d", path, size, (long long)off, rc);
-    return rc;
+    do { n = pwrite(o->fd, buf, size, off); } while (n < 0 && errno == EINTR);
+    if (n > 0) o->modified = 1;
+    return (n < 0) ? -errno : (int)n;
 }
 
-/* Render `n` bytes as lowercase hex into out (which must hold 2*n+1). */
-static void bytes_to_hex(const unsigned char *in, size_t n, char *out) {
-    static const char H[] = "0123456789abcdef";
-    for (size_t i = 0; i < n; i++) {
-        out[2*i]     = H[(in[i] >> 4) & 0xF];
-        out[2*i + 1] = H[in[i] & 0xF];
-    }
-    out[2*n] = '\0';
+/* Recompute the content checksum and persist size/mtime/atime + checksum
+ * for object `id`. Caller holds the lock. */
+static int persist_after_write(const vfs_object_id *id, int fd,
+                               const char *parent) {
+    struct stat stt;
+    if (fstat(fd, &stt) != 0) return -errno;
+    int64_t mt = (int64_t)stt.st_mtim.tv_sec * 1000000000LL + stt.st_mtim.tv_nsec;
+    int64_t at = (int64_t)stt.st_atim.tv_sec * 1000000000LL + stt.st_atim.tv_nsec;
+    if (vfs_object_set_stat(CTX.store, id, (int64_t)stt.st_size, mt, at) != VFS_OK)
+        return -EIO;
+    char cpath[VFS_PATH_MAX], hex[65];
+    if (vfs_content_path(CTX.store, id, cpath, sizeof cpath) == VFS_OK &&
+        vfs_sha256_hex_path(cpath, hex) == VFS_OK)
+        vfs_object_set_checksum(CTX.store, id, hex, NULL, 0);
+    else
+        vfs_object_set_checksum(CTX.store, id, NULL, NULL, 0);
+    notify(parent);
+    return 0;
 }
 
-/* Update size/mtime/atime, and (when ofile is non-NULL) the checksum
- * columns too. If the per-fd SHA state is still live and covers the
- * full current file size, write the new digest + intermediate state.
- * Otherwise null both checksum columns — they're no longer trustworthy. */
-static int sync_object_meta(PGconn *pg, const char *oid_hex,
-                            struct vfs_ofile *o, int fd) {
-    struct stat st;
-    if (fstat(fd, &st) != 0) return -errno;
-    I64STR(size_s,  (int64_t)st.st_size);
-    int64_t mt_ns = (int64_t)st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec;
-    int64_t at_ns = (int64_t)st.st_atim.tv_sec * 1000000000LL + st.st_atim.tv_nsec;
-    I64STR(mt_s, mt_ns);
-    I64STR(at_s, at_ns);
+static int op_flush(const char *path, struct fuse_file_info *fi) {
+    struct vfs_ofile *o = VFS_OFILE(fi);
+    trace("flush %s", path);
+    if (!o || !o->writable || !o->modified || o->fd <= 0) return 0;
+    if (fsync(o->fd) != 0) return -errno;
+    LOCK();
+    int rc = persist_after_write(&o->id, o->fd, o->parent);
+    UNLOCK();
+    if (rc) return rc;
+    o->modified = 0;
+    return 0;
+}
 
-    int can_hash = o && o->sha_live && o->known_size == (int64_t)st.st_size;
-    if (can_hash) {
-        unsigned char state[VFS_SHA256_STATE_LEN];
-        char state_hex[VFS_SHA256_STATE_LEN * 2 + 1];
-        char hex[65];
-        if (vfs_sha256_stream_snapshot(&o->sha, state) != VFS_OK ||
-            vfs_sha256_stream_finalize(&o->sha, hex)   != VFS_OK) {
-            ofile_invalidate_sha(o);
-            can_hash = 0;
-        } else {
-            o->sha_live = 0;  /* finalize consumed the ctx */
-            bytes_to_hex(state, sizeof state, state_hex);
-            const char *params[6] = { size_s, mt_s, at_s, hex, state_hex, oid_hex };
-            return exec_command(pg,
-                "UPDATE objects "
-                "SET size = $1::bigint, mtime_ns = $2::bigint, "
-                "    atime_ns = $3::bigint, checksum = $4, "
-                "    checksum_state = decode($5, 'hex') "
-                "WHERE object_id = $6",
-                6, params);
-        }
-    }
-    /* sha_live was false (or finalize failed): null both columns. */
-    const char *params[4] = { size_s, mt_s, at_s, oid_hex };
-    return exec_command(pg,
-        "UPDATE objects "
-        "SET size = $1::bigint, mtime_ns = $2::bigint, "
-        "    atime_ns = $3::bigint, checksum = NULL, "
-        "    checksum_state = NULL "
-        "WHERE object_id = $4",
-        4, params);
+static int op_fsync(const char *path, int datasync, struct fuse_file_info *fi) {
+    (void)path;
+    struct vfs_ofile *o = VFS_OFILE(fi);
+    if (!o || o->fd <= 0) return 0;
+    int rc = datasync ? fdatasync(o->fd) : fsync(o->fd);
+    return rc == 0 ? 0 : -errno;
 }
 
 static int op_release(const char *path, struct fuse_file_info *fi) {
+    (void)path;
     struct vfs_ofile *o = VFS_OFILE(fi);
-    trace("release %s fd=%d", path, o ? o->fd : -1);
-    ofile_free(o);
+    if (o) { if (o->fd > 0) close(o->fd); free(o); }
     fi->fh = 0;
     return 0;
 }
@@ -542,113 +439,30 @@ static int op_create(const char *path, mode_t mode, struct fuse_file_info *fi) {
     if (rc) return rc;
     if (cp.is_root) return -EISDIR;
 
-    PGconn *pg = conn_pool_get(CTX.pool);
-    if (!pg) return -EIO;
-
-    vfs_object_id id;
-    if (vfs_object_id_generate(&id) != VFS_OK) return -EIO;
-    int64_t now = vfs_now_ns();
-    I64STR(now_s, now);
-    I64STR(mode_s, (int64_t)(mode & 07777));
-
-    /* Phase 9 ordering: create the content file (and fsync it + its
-     * parent dir) BEFORE the metadata transaction commits. A crash
-     * between content creation and DB commit leaves an orphan content
-     * file -- recoverable via `viewfs check --fix`. A crash after the
-     * commit leaves a fully consistent new object. */
-    if (vfs_content_create_empty(CTX.store, &id) != VFS_OK) return -EIO;
-
-    if (exec_command(pg, "BEGIN", 0, NULL)) {
-        vfs_content_unlink(CTX.store, &id);
-        return -EIO;
-    }
-    rc = ensure_parent_dirs_pg(pg, CTX.view_name, cp.parent);
-    if (rc) {
-        exec_command(pg, "ROLLBACK", 0, NULL);
-        vfs_content_unlink(CTX.store, &id);
-        return rc;
-    }
-
-    /* Initialize a SHA stream for the new empty file; its initial hex
-     * + intermediate state go straight into the row, and the same
-     * stream is kept live in the ofile for subsequent appends. */
-    vfs_sha256_stream sha = { 0 };
-    if (vfs_sha256_stream_init(&sha) != VFS_OK) {
-        exec_command(pg, "ROLLBACK", 0, NULL);
-        vfs_content_unlink(CTX.store, &id);
-        return -EIO;
-    }
-    unsigned char state_raw[VFS_SHA256_STATE_LEN];
-    char state_hex[VFS_SHA256_STATE_LEN * 2 + 1];
-    char hex[65];
-    if (vfs_sha256_stream_snapshot(&sha, state_raw) != VFS_OK ||
-        vfs_sha256_stream_peek_hex(&sha, hex)       != VFS_OK) {
-        vfs_sha256_stream_abort(&sha);
-        exec_command(pg, "ROLLBACK", 0, NULL);
-        vfs_content_unlink(CTX.store, &id);
-        return -EIO;
-    }
-    bytes_to_hex(state_raw, sizeof state_raw, state_hex);
-
     struct fuse_context *fctx = fuse_get_context();
-    I64STR(uid_s, (int64_t)fctx->uid);
-    I64STR(gid_s, (int64_t)fctx->gid);
+    vfs_object_id id;
 
-    const char *oparams[9] = {
-        id.hex, mode_s, now_s, now_s, now_s, uid_s, gid_s, hex, state_hex
-    };
-    rc = exec_command(pg,
-        "INSERT INTO objects "
-        "(object_id, kind, mode, size, ctime_ns, mtime_ns, atime_ns, "
-        " uid, gid, checksum, checksum_state) "
-        "VALUES ($1, 'file', $2::int, 0, $3::bigint, $4::bigint, "
-        "        $5::bigint, $6::int, $7::int, $8, decode($9, 'hex'))",
-        9, oparams);
-    if (rc) {
-        vfs_sha256_stream_abort(&sha);
-        exec_command(pg, "ROLLBACK", 0, NULL);
-        vfs_content_unlink(CTX.store, &id);
-        return rc;
-    }
-
-    const char *mparams[7] = {
-        CTX.view_name, cp.path, cp.parent, cp.name, id.hex, now_s, now_s
-    };
-    rc = exec_command(pg,
-        "INSERT INTO mappings "
-        "(view_name, view_path, parent_path, name, entry_kind, object_id, "
-        " ctime_ns, mtime_ns) "
-        "VALUES ($1, $2, $3, $4, 'file', $5, $6::bigint, $7::bigint)",
-        7, mparams);
-    if (rc) {
-        vfs_sha256_stream_abort(&sha);
-        exec_command(pg, "ROLLBACK", 0, NULL);
-        vfs_content_unlink(CTX.store, &id);
-        return rc;
-    }
-
-    if (exec_command(pg, "COMMIT", 0, NULL)) {
-        vfs_sha256_stream_abort(&sha);
-        exec_command(pg, "ROLLBACK", 0, NULL);
-        vfs_content_unlink(CTX.store, &id);
+    LOCK();
+    rc = ensure_dir(parent_dir(&cp));
+    if (rc) { UNLOCK(); return rc; }
+    vfs_error e = vfs_object_create_file(CTX.store, cp.name, (int)(mode & 07777),
+                                         0, (int)fctx->uid, (int)fctx->gid,
+                                         NULL, NULL, 0, NULL, 0, &id);
+    if (e != VFS_OK) { UNLOCK(); return -EIO; }
+    if (vfs_content_create_empty(CTX.store, &id) != VFS_OK) {
+        vfs_object_delete(CTX.store, &id);
+        UNLOCK();
         return -EIO;
     }
-    notify_parent(pg, cp.parent);
-    if (cp.parent[0]) notify_parent(pg, "");
+    rc = apply_dir_props(parent_dir(&cp), &id, 1);
+    if (rc) { UNLOCK(); return rc; }
+    notify(parent_dir(&cp));
+    UNLOCK();
+
     int fd = open_content_file(&id, O_RDWR);
-    if (fd < 0) {
-        /* metadata committed and content exists, but we somehow can't
-         * open it -- caller will see -EIO and `viewfs check` would
-         * report any mismatch. Best to NOT unlink here lest we orphan
-         * a committed mapping. */
-        vfs_sha256_stream_abort(&sha);
-        return fd;
-    }
-    struct vfs_ofile *o = ofile_new(fd, 1);
-    if (!o) { vfs_sha256_stream_abort(&sha); close(fd); return -ENOMEM; }
-    o->sha        = sha;     /* hand the live stream to the ofile */
-    o->sha_live   = 1;
-    o->known_size = 0;
+    if (fd < 0) return fd;
+    struct vfs_ofile *o = ofile_new(fd, 1, &id, parent_dir(&cp));
+    if (!o) { close(fd); return -ENOMEM; }
     fi->fh = (uint64_t)(uintptr_t)o;
     return 0;
 }
@@ -659,32 +473,24 @@ static int op_truncate(const char *path, off_t off, struct fuse_file_info *fi) {
     if (fi && fi->fh) {
         struct vfs_ofile *o = VFS_OFILE(fi);
         if (ftruncate(o->fd, off) != 0) return -errno;
-        /* Any truncate (grow OR shrink) invalidates the running hash:
-         * shrinking removes already-hashed bytes; growing inserts zero
-         * bytes between known_size and the new EOF that we never fed
-         * to the stream. Either way the SHA is no longer trustworthy. */
         o->modified = 1;
-        ofile_invalidate_sha(o);
         return 0;
     }
     vfs_canon_path cp;
     int rc = canon(path, &cp);
     if (rc) return rc;
-    PGconn *pg = conn_pool_get(CTX.pool);
-    if (!pg) return -EIO;
-    char kind[16], oid[VFS_OID_HEX_LEN + 1];
-    rc = lookup_mapping(pg, CTX.view_name, cp.path,
-                        kind, sizeof kind, oid, sizeof oid);
-    if (rc) return rc;
-    if (strcmp(kind, "file")) return -EISDIR;
     vfs_object_id id;
-    snprintf(id.hex, sizeof id.hex, "%s", oid);
+    LOCK();
+    rc = resolve_file(&cp, &id);
+    UNLOCK();
+    if (rc) return rc;
     int fd = open_content_file(&id, O_RDWR);
     if (fd < 0) return fd;
     int rc2 = (ftruncate(fd, off) != 0) ? -errno : 0;
     if (rc2 == 0) {
-        sync_object_meta(pg, oid, NULL, fd);
-        notify_parent(pg, cp.parent);
+        LOCK();
+        persist_after_write(&id, fd, parent_dir(&cp));
+        UNLOCK();
     }
     close(fd);
     return rc2;
@@ -697,30 +503,15 @@ static int op_unlink(const char *path) {
     int rc = canon(path, &cp);
     if (rc) return rc;
     if (cp.is_root) return -EISDIR;
-    PGconn *pg = conn_pool_get(CTX.pool);
-    if (!pg) return -EIO;
-    const char *params[2] = { CTX.view_name, cp.path };
-    PGresult *r = PQexecParams(pg,
-        "DELETE FROM mappings WHERE view_name=$1 AND view_path=$2 "
-        "AND entry_kind <> 'dir'",
-        2, NULL, params, NULL, NULL, 0);
-    if (PQresultStatus(r) != PGRES_COMMAND_OK) {
-        trace("unlink sql: %s", PQresultErrorMessage(r));
-        PQclear(r); return -EIO;
-    }
-    int affected = atoi(PQcmdTuples(r));
-    PQclear(r);
-    if (!affected) {
-        /* could be a directory or non-existent — check */
-        char kind[16], oid[VFS_OID_HEX_LEN + 1];
-        rc = lookup_mapping(pg, CTX.view_name, cp.path, kind, sizeof kind,
-                            oid, sizeof oid);
-        if (rc == -ENOENT) return -ENOENT;
-        if (!strcmp(kind, "dir")) return -EISDIR;
-        return -EIO;
-    }
-    notify_parent(pg, cp.parent);
-    return 0;
+
+    LOCK();
+    vfs_object_id id;
+    rc = resolve_file(&cp, &id);             /* -EISDIR if it's a directory */
+    if (rc) { UNLOCK(); return rc; }
+    vfs_error e = vfs_object_delete(CTX.store, &id);
+    if (e == VFS_OK) notify(parent_dir(&cp));
+    UNLOCK();
+    return e == VFS_OK ? 0 : -EIO;
 }
 
 static int op_mkdir(const char *path, mode_t mode) {
@@ -730,37 +521,16 @@ static int op_mkdir(const char *path, mode_t mode) {
     int rc = canon(path, &cp);
     if (rc) return rc;
     if (cp.is_root) return -EEXIST;
-    PGconn *pg = conn_pool_get(CTX.pool);
-    if (!pg) return -EIO;
-    if (exec_command(pg, "BEGIN", 0, NULL)) return -EIO;
-    rc = ensure_parent_dirs_pg(pg, CTX.view_name, cp.parent);
-    if (rc) { exec_command(pg, "ROLLBACK", 0, NULL); return rc; }
-
-    int64_t now = vfs_now_ns();
-    I64STR(now_s, now);
-    I64STR(mode_s, (int64_t)(mode & 07777));
-    const char *params[7] = {
-        CTX.view_name, cp.path, cp.parent, cp.name, mode_s, now_s, now_s
-    };
-    PGresult *r = PQexecParams(pg,
-        "INSERT INTO mappings "
-        "(view_name, view_path, parent_path, name, entry_kind, object_id, "
-        " mode_override, ctime_ns, mtime_ns) "
-        "VALUES ($1, $2, $3, $4, 'dir', NULL, $5::int, $6::bigint, $7::bigint)",
-        7, NULL, params, NULL, NULL, 0);
-    int ok = (PQresultStatus(r) == PGRES_COMMAND_OK);
-    const char *code = ok ? NULL : PQresultErrorField(r, PG_DIAG_SQLSTATE);
-    int already = (code && !strcmp(code, "23505"));
-    if (!ok) trace("mkdir sql: %s", PQresultErrorMessage(r));
-    PQclear(r);
-    if (!ok) {
-        exec_command(pg, "ROLLBACK", 0, NULL);
-        return already ? -EEXIST : -EIO;
+    LOCK();
+    vfs_error e = vfs_dir_create(CTX.store, CTX.view_name, cp.path,
+                                 (int)(mode & 07777));
+    UNLOCK();
+    switch (e) {
+    case VFS_OK:           return 0;
+    case VFS_ERR_EXISTS:   return -EEXIST;
+    case VFS_ERR_NOTFOUND: return -ENOENT;
+    default:               return -EIO;
     }
-    if (exec_command(pg, "COMMIT", 0, NULL)) return -EIO;
-    notify_parent(pg, cp.parent);
-    if (cp.parent[0]) notify_parent(pg, "");
-    return 0;
 }
 
 static int op_rmdir(const char *path) {
@@ -770,107 +540,52 @@ static int op_rmdir(const char *path) {
     int rc = canon(path, &cp);
     if (rc) return rc;
     if (cp.is_root) return -EBUSY;
-    PGconn *pg = conn_pool_get(CTX.pool);
-    if (!pg) return -EIO;
-
-    /* Check existence + emptiness in one query. */
-    const char *params[2] = { CTX.view_name, cp.path };
-    PGresult *r = PQexecParams(pg,
-        "SELECT entry_kind, "
-        "  (SELECT count(*) FROM mappings c "
-        "   WHERE c.view_name = $1 AND c.parent_path = $2) AS n "
-        "FROM mappings WHERE view_name = $1 AND view_path = $2",
-        2, NULL, params, NULL, NULL, 0);
-    if (PQresultStatus(r) != PGRES_TUPLES_OK) { PQclear(r); return -EIO; }
-    if (PQntuples(r) == 0) { PQclear(r); return -ENOENT; }
-    const char *kind = PQgetvalue(r, 0, 0);
-    int children = atoi(PQgetvalue(r, 0, 1));
-    if (strcmp(kind, "dir") != 0) { PQclear(r); return -ENOTDIR; }
-    if (children > 0)             { PQclear(r); return -ENOTEMPTY; }
-    PQclear(r);
-
-    int rc2 = exec_command(pg,
-        "DELETE FROM mappings WHERE view_name = $1 AND view_path = $2",
-        2, params);
-    if (rc2 == 0) notify_parent(pg, cp.parent);
-    return rc2 == 0 ? 0 : -EIO;
+    LOCK();
+    vfs_error e = vfs_dir_remove(CTX.store, CTX.view_name, cp.path);
+    UNLOCK();
+    switch (e) {
+    case VFS_OK:            return 0;
+    case VFS_ERR_NOTFOUND:  return -ENOENT;
+    case VFS_ERR_NOTEMPTY:  return -ENOTEMPTY;
+    case VFS_ERR_BADARGS:   return -EBUSY;
+    default:                return -EIO;
+    }
 }
 
 /* ------------------------------------------------------------------
- * symlinks
+ * symlink / readlink
  * ------------------------------------------------------------------ */
 
-/* Reject targets with control chars; otherwise treat as opaque strings.
- * The README documents that kernel-side resolution of symlinks is outside
- * our control: an absolute target like "/etc/passwd" escapes the view at
- * the kernel layer, just as it does in any FUSE filesystem. Users who
- * want strict isolation should pair ViewFS with mount namespaces. */
 static int validate_symlink_target(const char *target) {
     if (!target || !*target) return -EINVAL;
     if (strlen(target) >= VFS_PATH_MAX) return -ENAMETOOLONG;
-    for (const unsigned char *p = (const unsigned char*)target; *p; p++) {
+    for (const unsigned char *p = (const unsigned char *)target; *p; p++)
         if (*p < 0x20) return -EINVAL;
-    }
     return 0;
 }
 
 static int op_symlink(const char *target, const char *linkpath) {
     trace("symlink %s -> %s", linkpath, target);
     if (CTX.read_only) return -EROFS;
-
     int trc = validate_symlink_target(target);
     if (trc) return trc;
-
     vfs_canon_path cp;
     int rc = canon(linkpath, &cp);
     if (rc) return rc;
     if (cp.is_root) return -EEXIST;
 
-    PGconn *pg = conn_pool_get(CTX.pool);
-    if (!pg) return -EIO;
-
-    vfs_object_id id;
-    if (vfs_object_id_generate(&id) != VFS_OK) return -EIO;
-    int64_t now = vfs_now_ns();
-    I64STR(now_s, now);
-    I64STR(size_s, (int64_t)strlen(target));
-
-    if (exec_command(pg, "BEGIN", 0, NULL)) return -EIO;
-    rc = ensure_parent_dirs_pg(pg, CTX.view_name, cp.parent);
-    if (rc) { exec_command(pg, "ROLLBACK", 0, NULL); return rc; }
-
     struct fuse_context *fctx = fuse_get_context();
-    I64STR(uid_s, (int64_t)fctx->uid);
-    I64STR(gid_s, (int64_t)fctx->gid);
-    const char *oparams[8] = {
-        id.hex, size_s, now_s, now_s, now_s, target, uid_s, gid_s
-    };
-    rc = exec_command(pg,
-        "INSERT INTO objects "
-        "(object_id, kind, mode, size, ctime_ns, mtime_ns, atime_ns, "
-        " symlink_target, uid, gid) "
-        "VALUES ($1, 'symlink', 0777, $2::bigint, $3::bigint, $4::bigint, "
-        "        $5::bigint, $6, $7::int, $8::int)",
-        8, oparams);
-    if (rc) { exec_command(pg, "ROLLBACK", 0, NULL); return rc; }
-
-    const char *mparams[7] = {
-        CTX.view_name, cp.path, cp.parent, cp.name, id.hex, now_s, now_s
-    };
-    rc = exec_command(pg,
-        "INSERT INTO mappings "
-        "(view_name, view_path, parent_path, name, entry_kind, object_id, "
-        " ctime_ns, mtime_ns) "
-        "VALUES ($1, $2, $3, $4, 'symlink', $5, $6::bigint, $7::bigint)",
-        7, mparams);
-    if (rc) { exec_command(pg, "ROLLBACK", 0, NULL); return rc; }
-
-    if (exec_command(pg, "COMMIT", 0, NULL)) {
-        exec_command(pg, "ROLLBACK", 0, NULL);
-        return -EIO;
-    }
-    notify_parent(pg, cp.parent);
-    if (cp.parent[0]) notify_parent(pg, "");
+    LOCK();
+    rc = ensure_dir(parent_dir(&cp));
+    if (rc) { UNLOCK(); return rc; }
+    vfs_object_id id;
+    vfs_error e = vfs_object_create_symlink(CTX.store, cp.name, target,
+                                            (int)fctx->uid, (int)fctx->gid, &id);
+    if (e != VFS_OK) { UNLOCK(); return -EIO; }
+    rc = apply_dir_props(parent_dir(&cp), &id, 1);
+    if (rc) { UNLOCK(); return rc; }
+    notify(parent_dir(&cp));
+    UNLOCK();
     return 0;
 }
 
@@ -880,31 +595,26 @@ static int op_readlink(const char *path, char *buf, size_t size) {
     int rc = canon(path, &cp);
     if (rc) return rc;
     if (cp.is_root) return -EINVAL;
+    if (size == 0) return -EINVAL;
 
-    PGconn *pg = conn_pool_get(CTX.pool);
-    if (!pg) return -EIO;
-    const char *params[2] = { CTX.view_name, cp.path };
-    PGresult *r = PQexecParams(pg,
-        "SELECT o.symlink_target FROM mappings m "
-        "JOIN objects o ON o.object_id = m.object_id "
-        "WHERE m.view_name = $1 AND m.view_path = $2 "
-        "AND m.entry_kind = 'symlink'",
-        2, NULL, params, NULL, NULL, 0);
-    if (PQresultStatus(r) != PGRES_TUPLES_OK) { PQclear(r); return -EIO; }
-    if (PQntuples(r) == 0)                    { PQclear(r); return -EINVAL; }
-    if (PQgetisnull(r, 0, 0))                 { PQclear(r); return -EIO; }
-    const char *target = PQgetvalue(r, 0, 0);
+    LOCK();
+    vfs_object_id id;
+    rc = resolve_file(&cp, &id);
+    if (rc) { UNLOCK(); return rc; }
+    char target[VFS_PATH_MAX];
+    vfs_error e = vfs_object_symlink_target(CTX.store, &id, target, sizeof target);
+    UNLOCK();
+    if (e == VFS_ERR_NOTFOUND) return -EINVAL;   /* not a symlink */
+    if (e != VFS_OK) return -EIO;
     size_t tlen = strlen(target);
-    if (size == 0)            { PQclear(r); return -EINVAL; }
     if (tlen >= size) tlen = size - 1;
     memcpy(buf, target, tlen);
     buf[tlen] = '\0';
-    PQclear(r);
     return 0;
 }
 
 /* ------------------------------------------------------------------
- * rename (intra-mount only; cross-mount returns EXDEV via kernel)
+ * rename: file = move (edit object props); directory = subtree move
  * ------------------------------------------------------------------ */
 
 static int op_rename(const char *from, const char *to, unsigned int flags) {
@@ -915,99 +625,65 @@ static int op_rename(const char *from, const char *to, unsigned int flags) {
 
     vfs_canon_path sf, df;
     int rc = canon(from, &sf); if (rc) return rc;
-    rc = canon(to,   &df);     if (rc) return rc;
+    rc = canon(to, &df);       if (rc) return rc;
     if (sf.is_root || df.is_root) return -EBUSY;
     if (!strcmp(sf.path, df.path)) return 0;
 
-    /* Refuse moving a directory into its own descendant. */
-    size_t slen = strlen(sf.path);
-    if (!strncmp(df.path, sf.path, slen) && df.path[slen] == '/')
-        return -EINVAL;
+    LOCK();
+    int src_is_dir = 0;
+    if (vfs_dir_exists(CTX.store, CTX.view_name, sf.path, &src_is_dir) != VFS_OK) {
+        UNLOCK(); return -EIO;
+    }
 
-    PGconn *pg = conn_pool_get(CTX.pool);
-    if (!pg) return -EIO;
-    if (exec_command(pg, "BEGIN", 0, NULL)) return -EIO;
-
-    /* Confirm source exists; cache its kind. */
-    char skind[16], soid[VFS_OID_HEX_LEN + 1];
-    rc = lookup_mapping(pg, CTX.view_name, sf.path, skind, sizeof skind,
-                        soid, sizeof soid);
-    if (rc) { exec_command(pg, "ROLLBACK", 0, NULL); return rc; }
-
-    /* Check destination state. */
-    char dkind[16], doid[VFS_OID_HEX_LEN + 1];
-    int drc = lookup_mapping(pg, CTX.view_name, df.path, dkind, sizeof dkind,
-                             doid, sizeof doid);
-    if (drc == 0) {
-        if (flags & RENAME_NOREPLACE) {
-            exec_command(pg, "ROLLBACK", 0, NULL);
-            return -EEXIST;
+    if (src_is_dir) {
+        vfs_error e = vfs_dir_rename(CTX.store, CTX.view_name, sf.path, df.path);
+        UNLOCK();
+        switch (e) {
+        case VFS_OK:           return 0;
+        case VFS_ERR_NOTFOUND: return -ENOENT;
+        case VFS_ERR_EXISTS:   return -EEXIST;
+        case VFS_ERR_BADARGS:  return -EINVAL;
+        default:               return -EIO;
         }
-        /* If dest is a dir, source must also be a dir AND dest must be empty. */
-        if (!strcmp(dkind, "dir")) {
-            if (strcmp(skind, "dir")) {
-                exec_command(pg, "ROLLBACK", 0, NULL);
-                return -EISDIR;
-            }
-            const char *cparams[2] = { CTX.view_name, df.path };
-            PGresult *cr = PQexecParams(pg,
-                "SELECT count(*) FROM mappings "
-                "WHERE view_name = $1 AND parent_path = $2",
-                2, NULL, cparams, NULL, NULL, 0);
-            int n = (PQresultStatus(cr) == PGRES_TUPLES_OK)
-                ? atoi(PQgetvalue(cr, 0, 0)) : -1;
-            PQclear(cr);
-            if (n != 0) {
-                exec_command(pg, "ROLLBACK", 0, NULL);
-                return n < 0 ? -EIO : -ENOTEMPTY;
-            }
-        } else if (!strcmp(skind, "dir")) {
-            exec_command(pg, "ROLLBACK", 0, NULL);
-            return -ENOTDIR;
-        }
-        /* Delete the existing destination mapping. */
-        const char *dp[2] = { CTX.view_name, df.path };
-        if (exec_command(pg,
-            "DELETE FROM mappings WHERE view_name = $1 AND view_path = $2",
-            2, dp)) { exec_command(pg, "ROLLBACK", 0, NULL); return -EIO; }
-    } else if (drc != -ENOENT) {
-        exec_command(pg, "ROLLBACK", 0, NULL);
-        return drc;
     }
 
-    rc = ensure_parent_dirs_pg(pg, CTX.view_name, df.parent);
-    if (rc) { exec_command(pg, "ROLLBACK", 0, NULL); return rc; }
+    /* Source is a file/symlink. */
+    vfs_object_id id;
+    rc = resolve_file(&sf, &id);
+    if (rc) { UNLOCK(); return rc; }
 
-    /* If source is a directory, rewrite the prefixes of every descendant
-     * BEFORE moving the directory itself, so the PK on the moved row
-     * doesn't collide with descendants. */
-    if (!strcmp(skind, "dir")) {
-        const char *p1[4] = { CTX.view_name, sf.path, df.path, sf.path };
-        if (exec_command(pg,
-            "UPDATE mappings SET "
-            "  view_path   = $3 || substr(view_path,   length($2) + 1), "
-            "  parent_path = $3 || substr(parent_path, length($2) + 1) "
-            "WHERE view_name = $1 AND view_path LIKE $4 || '/%'",
-            4, p1)) { exec_command(pg, "ROLLBACK", 0, NULL); return -EIO; }
+    /* Destination: reject if it is a directory; replace an existing file. */
+    int dst_is_dir = 0;
+    if (vfs_dir_exists(CTX.store, CTX.view_name, df.path, &dst_is_dir) != VFS_OK) {
+        UNLOCK(); return -EIO;
+    }
+    if (dst_is_dir) { UNLOCK(); return -EISDIR; }
+    vfs_object_id dvictim;
+    vfs_error de = vfs_dir_member_by_name(CTX.store, CTX.view_name,
+                                          parent_dir(&df), df.name, &dvictim);
+    if (de == VFS_OK) {
+        if (flags & RENAME_NOREPLACE) { UNLOCK(); return -EEXIST; }
+        vfs_object_delete(CTX.store, &dvictim);
+    } else if (de != VFS_ERR_NOTFOUND && de != VFS_ERR_AMBIGUOUS) {
+        UNLOCK(); return -EIO;
     }
 
-    /* Move the entry itself: update view_path/parent_path/name. */
-    const char *p2[5] = { CTX.view_name, sf.path, df.path, df.parent, df.name };
-    if (exec_command(pg,
-        "UPDATE mappings SET view_path = $3, parent_path = $4, name = $5 "
-        "WHERE view_name = $1 AND view_path = $2",
-        5, p2)) { exec_command(pg, "ROLLBACK", 0, NULL); return -EIO; }
+    rc = ensure_dir(parent_dir(&df));
+    if (rc) { UNLOCK(); return rc; }
 
-    if (exec_command(pg, "COMMIT", 0, NULL)) {
-        exec_command(pg, "ROLLBACK", 0, NULL); return -EIO;
-    }
-    notify_parent(pg, sf.parent);
-    if (strcmp(sf.parent, df.parent) != 0) notify_parent(pg, df.parent);
+    /* Move = lose source-dir pairs, gain dest-dir pairs, keep the rest. */
+    int r1 = apply_dir_props(parent_dir(&sf), &id, 0);
+    int r2 = apply_dir_props(parent_dir(&df), &id, 1);
+    vfs_object_set_name(CTX.store, &id, df.name);
+    notify(parent_dir(&sf));
+    if (strcmp(parent_dir(&sf), parent_dir(&df)) != 0) notify(parent_dir(&df));
+    UNLOCK();
+    if (r1 || r2) return -EIO;
     return 0;
 }
 
 /* ------------------------------------------------------------------
- * utimens / chmod / chown / flush / fsync
+ * utimens / chmod / chown
  * ------------------------------------------------------------------ */
 
 static int op_utimens(const char *path, const struct timespec ts[2],
@@ -1019,39 +695,25 @@ static int op_utimens(const char *path, const struct timespec ts[2],
     int rc = canon(path, &cp);
     if (rc) return rc;
     if (cp.is_root) return 0;
-    PGconn *pg = conn_pool_get(CTX.pool);
-    if (!pg) return -EIO;
-    char kind[16], oid[VFS_OID_HEX_LEN + 1];
-    rc = lookup_mapping(pg, CTX.view_name, cp.path,
-                        kind, sizeof kind, oid, sizeof oid);
-    if (rc) return rc;
 
     int64_t now = vfs_now_ns();
-    int64_t atime_ns = (ts[0].tv_nsec == UTIME_NOW || ts[0].tv_nsec == UTIME_OMIT)
-        ? now
-        : (int64_t)ts[0].tv_sec * 1000000000LL + ts[0].tv_nsec;
-    int64_t mtime_ns = (ts[1].tv_nsec == UTIME_NOW || ts[1].tv_nsec == UTIME_OMIT)
-        ? now
-        : (int64_t)ts[1].tv_sec * 1000000000LL + ts[1].tv_nsec;
+    int64_t at = (ts[0].tv_nsec == UTIME_NOW || ts[0].tv_nsec == UTIME_OMIT)
+        ? now : (int64_t)ts[0].tv_sec * 1000000000LL + ts[0].tv_nsec;
+    int64_t mt = (ts[1].tv_nsec == UTIME_NOW || ts[1].tv_nsec == UTIME_OMIT)
+        ? now : (int64_t)ts[1].tv_sec * 1000000000LL + ts[1].tv_nsec;
 
-    int rc2 = 0;
-    if (!strcmp(kind, "file") && oid[0]) {
-        I64STR(at_s, atime_ns); I64STR(mt_s, mtime_ns);
-        const char *p[3] = { at_s, mt_s, oid };
-        rc2 = exec_command(pg,
-            "UPDATE objects SET atime_ns = $1::bigint, mtime_ns = $2::bigint "
-            "WHERE object_id = $3",
-            3, p);
-    } else if (!strcmp(kind, "dir")) {
-        I64STR(mt_s, mtime_ns);
-        const char *p[3] = { mt_s, CTX.view_name, cp.path };
-        rc2 = exec_command(pg,
-            "UPDATE mappings SET mtime_ns = $1::bigint "
-            "WHERE view_name = $2 AND view_path = $3",
-            3, p);
+    LOCK();
+    int isdir = 0;
+    if (vfs_dir_exists(CTX.store, CTX.view_name, cp.path, &isdir) != VFS_OK) {
+        UNLOCK(); return -EIO;
     }
-    if (rc2 == 0) notify_parent(pg, cp.parent);
-    return rc2 == 0 ? 0 : -EIO;
+    if (isdir) { UNLOCK(); return 0; }   /* dir timestamps not tracked */
+    vfs_object_id id;
+    rc = resolve_file(&cp, &id);
+    if (rc) { UNLOCK(); return rc; }
+    vfs_error e = vfs_object_set_times(CTX.store, &id, mt, at);
+    UNLOCK();
+    return e == VFS_OK ? 0 : -EIO;
 }
 
 static int op_chmod(const char *path, mode_t mode, struct fuse_file_info *fi) {
@@ -1062,29 +724,24 @@ static int op_chmod(const char *path, mode_t mode, struct fuse_file_info *fi) {
     int rc = canon(path, &cp);
     if (rc) return rc;
     if (cp.is_root) return 0;
-    PGconn *pg = conn_pool_get(CTX.pool);
-    if (!pg) return -EIO;
-    char kind[16], oid[VFS_OID_HEX_LEN + 1];
-    rc = lookup_mapping(pg, CTX.view_name, cp.path,
-                        kind, sizeof kind, oid, sizeof oid);
-    if (rc) return rc;
 
-    I64STR(mode_s, (int64_t)(mode & 07777));
-    int rc2 = 0;
-    if (!strcmp(kind, "file") && oid[0]) {
-        const char *p[2] = { mode_s, oid };
-        rc2 = exec_command(pg,
-            "UPDATE objects SET mode = $1::int WHERE object_id = $2",
-            2, p);
-    } else if (!strcmp(kind, "dir")) {
-        const char *p[3] = { mode_s, CTX.view_name, cp.path };
-        rc2 = exec_command(pg,
-            "UPDATE mappings SET mode_override = $1::int "
-            "WHERE view_name = $2 AND view_path = $3",
-            3, p);
+    LOCK();
+    int isdir = 0;
+    if (vfs_dir_exists(CTX.store, CTX.view_name, cp.path, &isdir) != VFS_OK) {
+        UNLOCK(); return -EIO;
     }
-    if (rc2 == 0) notify_parent(pg, cp.parent);
-    return rc2 == 0 ? 0 : -EIO;
+    vfs_error e;
+    if (isdir) {
+        e = vfs_dir_set_mode(CTX.store, CTX.view_name, cp.path, (int)(mode & 07777));
+    } else {
+        vfs_object_id id;
+        rc = resolve_file(&cp, &id);
+        if (rc) { UNLOCK(); return rc; }
+        e = vfs_object_set_mode(CTX.store, &id, (int)(mode & 07777));
+        notify(parent_dir(&cp));
+    }
+    UNLOCK();
+    return e == VFS_OK ? 0 : -EIO;
 }
 
 static int op_chown(const char *path, uid_t uid, gid_t gid,
@@ -1092,276 +749,163 @@ static int op_chown(const char *path, uid_t uid, gid_t gid,
     (void)fi;
     trace("chown %s uid=%u gid=%u", path, (unsigned)uid, (unsigned)gid);
     if (CTX.read_only) return -EROFS;
-    int change_uid = (uid != (uid_t)-1);
-    int change_gid = (gid != (gid_t)-1);
-    if (!change_uid && !change_gid) return 0;  /* nothing to do */
-
+    int cu = (uid != (uid_t)-1), cg = (gid != (gid_t)-1);
+    if (!cu && !cg) return 0;
     vfs_canon_path cp;
     int rc = canon(path, &cp);
     if (rc) return rc;
     if (cp.is_root) return 0;
 
-    PGconn *pg = conn_pool_get(CTX.pool);
-    if (!pg) return -EIO;
-    char kind[16], oid[VFS_OID_HEX_LEN + 1];
-    rc = lookup_mapping(pg, CTX.view_name, cp.path,
-                        kind, sizeof kind, oid, sizeof oid);
-    if (rc) return rc;
-    /* Directory mappings don't have an underlying object; chown on a
-     * directory is silently accepted but not persisted. */
-    if (!strcmp(kind, "dir") || !oid[0]) return 0;
-
-    I64STR(uid_s, (int64_t)uid);
-    I64STR(gid_s, (int64_t)gid);
-    int rc2 = 0;
-    if (change_uid && change_gid) {
-        const char *p[3] = { uid_s, gid_s, oid };
-        rc2 = exec_command(pg,
-            "UPDATE objects SET uid = $1::int, gid = $2::int "
-            "WHERE object_id = $3",
-            3, p);
-    } else if (change_uid) {
-        const char *p[2] = { uid_s, oid };
-        rc2 = exec_command(pg,
-            "UPDATE objects SET uid = $1::int WHERE object_id = $2",
-            2, p);
-    } else {
-        const char *p[2] = { gid_s, oid };
-        rc2 = exec_command(pg,
-            "UPDATE objects SET gid = $1::int WHERE object_id = $2",
-            2, p);
+    LOCK();
+    int isdir = 0;
+    if (vfs_dir_exists(CTX.store, CTX.view_name, cp.path, &isdir) != VFS_OK) {
+        UNLOCK(); return -EIO;
     }
-    if (rc2 == 0) notify_parent(pg, cp.parent);
-    return rc2 == 0 ? 0 : -EIO;
-}
-
-static int op_flush(const char *path, struct fuse_file_info *fi) {
-    struct vfs_ofile *o = VFS_OFILE(fi);
-    int fd        = o ? o->fd       : -1;
-    int writable  = o ? o->writable : 0;
-    int modified  = o ? o->modified : 0;
-    trace("flush %s fd=%d write=%d modified=%d", path, fd, writable, modified);
-
-    /* op_flush is what close(2) synchronizes against. By doing the fsync
-     * here (rather than in op_release, which is async to close), a
-     * close() that returns 0 implies the bytes are durably on disk and
-     * the DB has recorded the new size + checksum. */
-    if (!writable || !modified || fd <= 0 || !path) return 0;
-
-    if (fsync(fd) != 0) return -errno;
-
-    vfs_canon_path cp;
-    if (canon(path, &cp) != 0 || cp.is_root) return 0;
-    PGconn *pg = conn_pool_get(CTX.pool);
-    if (!pg) return -EIO;
-    char kind[16], oid[VFS_OID_HEX_LEN + 1];
-    if (lookup_mapping(pg, CTX.view_name, cp.path,
-                       kind, sizeof kind, oid, sizeof oid) != 0
-        || strcmp(kind, "file") != 0 || !oid[0]) {
-        /* mapping vanished (e.g. unlinked since open) — nothing to record */
-        o->modified = 0;
-        return 0;
-    }
-    if (sync_object_meta(pg, oid, o, fd) != 0) return -EIO;
-    notify_parent(pg, cp.parent);
-    /* Idempotency: a second op_flush on this fd without further writes
-     * should be a no-op. The sha was consumed (sha_live=0); resetting
-     * modified prevents us from re-nulling the checksum we just set. */
-    o->modified = 0;
-    return 0;
-}
-
-static int op_fsync(const char *path, int datasync, struct fuse_file_info *fi) {
-    struct vfs_ofile *o = VFS_OFILE(fi);
-    int fd = o ? o->fd : -1;
-    if (fd <= 0) { trace("fsync %s -> 0 (no fd)", path); return 0; }
-    int rc = datasync ? fdatasync(fd) : fsync(fd);
-    int ret = rc == 0 ? 0 : -errno;
-    trace("fsync %s datasync=%d -> %d", path, datasync, ret);
-    return ret;
+    if (isdir) { UNLOCK(); return 0; }   /* directories own no object */
+    vfs_object_id id;
+    rc = resolve_file(&cp, &id);
+    if (rc) { UNLOCK(); return rc; }
+    vfs_error e = vfs_object_set_owner(CTX.store, &id,
+                                       cu ? (int)uid : -1, cg ? (int)gid : -1);
+    UNLOCK();
+    return e == VFS_OK ? 0 : -EIO;
 }
 
 /* ------------------------------------------------------------------
- * Extended attributes (Phase 5)
- *
- * Only names beginning with "user.viewfs." are honored; everything else
- * returns -ENOTSUP. The trailing portion is stored in the `attributes`
- * table keyed by the underlying object id.
+ * Extended attributes -> object_props under the "user.viewfs." prefix.
  * ------------------------------------------------------------------ */
 
-#include <sys/xattr.h>          /* XATTR_CREATE / XATTR_REPLACE */
-
 static const char XATTR_PREFIX[] = "user.viewfs.";
-#define XATTR_PREFIX_LEN  (sizeof XATTR_PREFIX - 1)
+#define XATTR_PREFIX_LEN (sizeof XATTR_PREFIX - 1)
 
-/* Resolve a path to its object id. Returns 0 on success, -errno on
- * failure. Directories use VFS_OID_HEX_LEN+1 of zeros (caller should
- * treat dir xattrs as not-yet-supported and return -ENOTSUP). */
-static int lookup_object(PGconn *pg, const char *vpath,
-                         char out_kind[16],
-                         char out_oid[VFS_OID_HEX_LEN + 1]) {
-    return lookup_mapping(pg, CTX.view_name, vpath,
-                          out_kind, 16, out_oid, VFS_OID_HEX_LEN + 1);
+/* Resolve a path to a file object for xattr ops. Holds-lock contract: caller
+ * locks. Returns 0+id, or -errno (dirs -> -ENOTSUP). */
+static int xattr_resolve(const vfs_canon_path *cp, vfs_object_id *id) {
+    int isdir = 0;
+    if (vfs_dir_exists(CTX.store, CTX.view_name, cp->path, &isdir) != VFS_OK)
+        return -EIO;
+    if (isdir) return -ENOTSUP;          /* xattrs on directories deferred */
+    return resolve_file(cp, id);
 }
 
-static int op_getxattr(const char *path, const char *name,
-                       char *value, size_t size) {
-    trace("getxattr %s name=%s sz=%zu", path, name, size);
+struct getx_ctx { const char *key; char *val; size_t len; int found; };
+static void getx_cb(const vfs_prop_row *p, void *ud) {
+    struct getx_ctx *g = ud;
+    if (!g->found && !strcmp(p->key, g->key)) {
+        g->len = strlen(p->value);
+        g->val = malloc(g->len + 1);
+        if (g->val) memcpy(g->val, p->value, g->len + 1);
+        g->found = 1;
+    }
+}
+
+static int op_getxattr(const char *path, const char *name, char *value, size_t size) {
+    trace("getxattr %s name=%s", path, name);
     if (strncmp(name, XATTR_PREFIX, XATTR_PREFIX_LEN) != 0) return -ENOTSUP;
     const char *key = name + XATTR_PREFIX_LEN;
-
     vfs_canon_path cp;
     int rc = canon(path, &cp);
     if (rc) return rc;
     if (cp.is_root) return -ENODATA;
 
-    PGconn *pg = conn_pool_get(CTX.pool);
-    if (!pg) return -EIO;
-    char kind[16], oid[VFS_OID_HEX_LEN + 1];
-    rc = lookup_object(pg, cp.path, kind, oid);
-    if (rc) return rc;
-    if (!oid[0]) return -ENODATA;  /* directory mapping carries no object */
+    LOCK();
+    vfs_object_id id;
+    rc = xattr_resolve(&cp, &id);
+    if (rc) { UNLOCK(); return rc == -ENOTSUP ? -ENODATA : rc; }
+    struct getx_ctx g = { .key = key, .val = NULL, .len = 0, .found = 0 };
+    vfs_object_prop_list(CTX.store, &id, getx_cb, &g);
+    UNLOCK();
 
-    const char *params[2] = { oid, key };
-    PGresult *r = PQexecParams(pg,
-        "SELECT value FROM attributes WHERE object_id = $1 AND key = $2",
-        2, NULL, params, NULL, NULL, 0);
-    if (PQresultStatus(r) != PGRES_TUPLES_OK) { PQclear(r); return -EIO; }
-    if (PQntuples(r) == 0) { PQclear(r); return -ENODATA; }
-    const char *val = PQgetvalue(r, 0, 0);
-    size_t vlen = (size_t)PQgetlength(r, 0, 0);
+    if (!g.found) return -ENODATA;
     int ret;
-    if (size == 0) {
-        ret = (int)vlen;
-    } else if (size < vlen) {
-        ret = -ERANGE;
-    } else {
-        memcpy(value, val, vlen);
-        ret = (int)vlen;
-    }
-    PQclear(r);
+    if (size == 0)            ret = (int)g.len;
+    else if (size < g.len)    ret = -ERANGE;
+    else { memcpy(value, g.val, g.len); ret = (int)g.len; }
+    free(g.val);
     return ret;
 }
 
-static int op_setxattr(const char *path, const char *name,
-                       const char *value, size_t size, int flags) {
-    trace("setxattr %s name=%s sz=%zu flags=0x%x", path, name, size, flags);
+static int op_setxattr(const char *path, const char *name, const char *value,
+                       size_t size, int flags) {
+    trace("setxattr %s name=%s", path, name);
     if (CTX.read_only) return -EROFS;
     if (strncmp(name, XATTR_PREFIX, XATTR_PREFIX_LEN) != 0) return -ENOTSUP;
     const char *key = name + XATTR_PREFIX_LEN;
     if (!*key) return -EINVAL;
+    for (size_t i = 0; i < size; i++) if (value[i] == '\0') return -EINVAL;
 
-    vfs_canon_path cp;
-    int rc = canon(path, &cp);
-    if (rc) return rc;
-    if (cp.is_root) return -EINVAL;
-
-    PGconn *pg = conn_pool_get(CTX.pool);
-    if (!pg) return -EIO;
-    char kind[16], oid[VFS_OID_HEX_LEN + 1];
-    rc = lookup_object(pg, cp.path, kind, oid);
-    if (rc) return rc;
-    if (!oid[0]) return -ENOTSUP;  /* xattrs on directories deferred */
-
-    /* The attributes.value column is TEXT. We pass the buffer with an
-     * explicit length so embedded NULs would survive in principle, but
-     * Postgres TEXT cannot contain '\0' -- reject early to avoid a DB
-     * error. */
-    for (size_t i = 0; i < size; i++) {
-        if (value[i] == '\0') return -EINVAL;
-    }
-
-    int64_t now = vfs_now_ns();
-    I64STR(now_s, now);
-
-    /* The libpq client truncates at the first NUL anyway; size has been
-     * validated to be NUL-free, so a null-terminated copy is safe. */
     char *vcopy = malloc(size + 1);
     if (!vcopy) return -ENOMEM;
     memcpy(vcopy, value, size);
     vcopy[size] = '\0';
 
-    int ret;
-    if (flags & XATTR_CREATE) {
-        const char *params[5] = { oid, key, vcopy, now_s, now_s };
-        PGresult *r = PQexecParams(pg,
-            "INSERT INTO attributes (object_id, key, value, ctime_ns, mtime_ns) "
-            "VALUES ($1, $2, $3, $4::bigint, $5::bigint) "
-            "ON CONFLICT (object_id, key) DO NOTHING",
-            5, NULL, params, NULL, NULL, 0);
-        int ok = (PQresultStatus(r) == PGRES_COMMAND_OK);
-        int affected = ok ? atoi(PQcmdTuples(r)) : 0;
-        PQclear(r);
-        if (!ok) ret = -EIO;
-        else if (!affected) ret = -EEXIST;
-        else ret = 0;
-    } else if (flags & XATTR_REPLACE) {
-        const char *params[4] = { vcopy, now_s, oid, key };
-        PGresult *r = PQexecParams(pg,
-            "UPDATE attributes SET value = $1, mtime_ns = $2::bigint "
-            "WHERE object_id = $3 AND key = $4",
-            4, NULL, params, NULL, NULL, 0);
-        int ok = (PQresultStatus(r) == PGRES_COMMAND_OK);
-        int affected = ok ? atoi(PQcmdTuples(r)) : 0;
-        PQclear(r);
-        if (!ok) ret = -EIO;
-        else if (!affected) ret = -ENODATA;
-        else ret = 0;
-    } else {
-        const char *params[5] = { oid, key, vcopy, now_s, now_s };
-        PGresult *r = PQexecParams(pg,
-            "INSERT INTO attributes (object_id, key, value, ctime_ns, mtime_ns) "
-            "VALUES ($1, $2, $3, $4::bigint, $5::bigint) "
-            "ON CONFLICT (object_id, key) DO UPDATE "
-            "  SET value = EXCLUDED.value, mtime_ns = EXCLUDED.mtime_ns",
-            5, NULL, params, NULL, NULL, 0);
-        int ok = (PQresultStatus(r) == PGRES_COMMAND_OK);
-        PQclear(r);
-        ret = ok ? 0 : -EIO;
+    vfs_canon_path cp;
+    int rc = canon(path, &cp);
+    if (rc) { free(vcopy); return rc; }
+    if (cp.is_root) { free(vcopy); return -EINVAL; }
+
+    LOCK();
+    vfs_object_id id;
+    rc = xattr_resolve(&cp, &id);
+    if (rc) { UNLOCK(); free(vcopy); return rc; }
+
+    /* Does the key currently exist (any value)? */
+    struct getx_ctx g = { .key = key, .val = NULL, .len = 0, .found = 0 };
+    vfs_object_prop_list(CTX.store, &id, getx_cb, &g);
+    free(g.val);
+    int ret = 0;
+    if ((flags & XATTR_CREATE) && g.found)        ret = -EEXIST;
+    else if ((flags & XATTR_REPLACE) && !g.found) ret = -ENODATA;
+    else {
+        /* xattr is single-valued: replace every value of key with this one. */
+        vfs_object_prop_unset(CTX.store, &id, key, NULL);
+        if (vfs_object_prop_add(CTX.store, &id, key, vcopy) != VFS_OK) ret = -EIO;
+        else notify(parent_dir(&cp));
     }
+    UNLOCK();
     free(vcopy);
     return ret;
 }
 
+struct listx_ctx { char keys[256][VFS_NAME_MAX + 1]; int n; char last[VFS_NAME_MAX + 1]; };
+static void listx_cb(const vfs_prop_row *p, void *ud) {
+    struct listx_ctx *l = ud;
+    if (l->n > 0 && !strcmp(l->last, p->key)) return;   /* dedupe (ordered) */
+    if (l->n < 256) {
+        snprintf(l->keys[l->n], sizeof l->keys[l->n], "%s", p->key);
+        l->n++;
+    }
+    snprintf(l->last, sizeof l->last, "%s", p->key);
+}
+
 static int op_listxattr(const char *path, char *list, size_t size) {
-    trace("listxattr %s sz=%zu", path, size);
+    trace("listxattr %s", path);
     vfs_canon_path cp;
     int rc = canon(path, &cp);
     if (rc) return rc;
     if (cp.is_root) return 0;
 
-    PGconn *pg = conn_pool_get(CTX.pool);
-    if (!pg) return -EIO;
-    char kind[16], oid[VFS_OID_HEX_LEN + 1];
-    rc = lookup_object(pg, cp.path, kind, oid);
-    if (rc) return rc;
-    if (!oid[0]) return 0;
+    LOCK();
+    vfs_object_id id;
+    rc = xattr_resolve(&cp, &id);
+    if (rc) { UNLOCK(); return rc == -ENOTSUP ? 0 : rc; }
+    static struct listx_ctx l;          /* big; under lock so single-use ok */
+    l.n = 0; l.last[0] = '\0';
+    vfs_object_prop_list(CTX.store, &id, listx_cb, &l);
+    UNLOCK();
 
-    const char *params[1] = { oid };
-    PGresult *r = PQexecParams(pg,
-        "SELECT key FROM attributes WHERE object_id = $1 ORDER BY key",
-        1, NULL, params, NULL, NULL, 0);
-    if (PQresultStatus(r) != PGRES_TUPLES_OK) { PQclear(r); return -EIO; }
-
-    /* Compute total bytes: sum("user.viewfs.<key>\0") for each row. */
-    int n = PQntuples(r);
     size_t total = 0;
-    for (int i = 0; i < n; i++) {
-        total += XATTR_PREFIX_LEN + (size_t)PQgetlength(r, i, 0) + 1;
-    }
-    if (size == 0) { PQclear(r); return (int)total; }
-    if (size < total) { PQclear(r); return -ERANGE; }
-
+    for (int i = 0; i < l.n; i++)
+        total += XATTR_PREFIX_LEN + strlen(l.keys[i]) + 1;
+    if (size == 0)    return (int)total;
+    if (size < total) return -ERANGE;
     size_t off = 0;
-    for (int i = 0; i < n; i++) {
-        memcpy(list + off, XATTR_PREFIX, XATTR_PREFIX_LEN);
-        off += XATTR_PREFIX_LEN;
-        size_t kl = (size_t)PQgetlength(r, i, 0);
-        memcpy(list + off, PQgetvalue(r, i, 0), kl);
-        off += kl;
+    for (int i = 0; i < l.n; i++) {
+        memcpy(list + off, XATTR_PREFIX, XATTR_PREFIX_LEN); off += XATTR_PREFIX_LEN;
+        size_t kl = strlen(l.keys[i]);
+        memcpy(list + off, l.keys[i], kl); off += kl;
         list[off++] = '\0';
     }
-    PQclear(r);
     return (int)total;
 }
 
@@ -1370,35 +914,27 @@ static int op_removexattr(const char *path, const char *name) {
     if (CTX.read_only) return -EROFS;
     if (strncmp(name, XATTR_PREFIX, XATTR_PREFIX_LEN) != 0) return -ENOTSUP;
     const char *key = name + XATTR_PREFIX_LEN;
-
     vfs_canon_path cp;
     int rc = canon(path, &cp);
     if (rc) return rc;
     if (cp.is_root) return -ENODATA;
 
-    PGconn *pg = conn_pool_get(CTX.pool);
-    if (!pg) return -EIO;
-    char kind[16], oid[VFS_OID_HEX_LEN + 1];
-    rc = lookup_object(pg, cp.path, kind, oid);
-    if (rc) return rc;
-    if (!oid[0]) return -ENODATA;
-
-    const char *params[2] = { oid, key };
-    PGresult *r = PQexecParams(pg,
-        "DELETE FROM attributes WHERE object_id = $1 AND key = $2",
-        2, NULL, params, NULL, NULL, 0);
-    if (PQresultStatus(r) != PGRES_COMMAND_OK) { PQclear(r); return -EIO; }
-    int affected = atoi(PQcmdTuples(r));
-    PQclear(r);
-    return affected ? 0 : -ENODATA;
+    LOCK();
+    vfs_object_id id;
+    rc = xattr_resolve(&cp, &id);
+    if (rc) { UNLOCK(); return rc == -ENOTSUP ? -ENODATA : rc; }
+    vfs_error e = vfs_object_prop_unset(CTX.store, &id, key, NULL);
+    if (e == VFS_OK) notify(parent_dir(&cp));
+    UNLOCK();
+    return e == VFS_OK ? 0 : (e == VFS_ERR_NOTFOUND ? -ENODATA : -EIO);
 }
 
 /* ------------------------------------------------------------------
- * statfs / access / init / destroy (unchanged from Phase 2)
+ * statfs / access / init / destroy
  * ------------------------------------------------------------------ */
 
 static int op_statfs(const char *path, struct statvfs *st) {
-    trace("statfs %s", path);
+    (void)path;
     if (statvfs(vfs_store_path(CTX.store), st) != 0) return -errno;
     return 0;
 }
@@ -1408,15 +944,18 @@ static int op_access(const char *path, int mask) {
     vfs_canon_path cp;
     int rc = canon(path, &cp);
     if (rc) return rc;
-    if (cp.is_root) return 0;
-    PGconn *pg = conn_pool_get(CTX.pool);
-    if (!pg) return -EIO;
-    const char *params[2] = { CTX.view_name, cp.path };
-    PGresult *r = PQexecParams(pg,
-        "SELECT 1 FROM mappings WHERE view_name=$1 AND view_path=$2",
-        2, NULL, params, NULL, NULL, 0);
-    int ok = (PQresultStatus(r) == PGRES_TUPLES_OK) && PQntuples(r) > 0;
-    PQclear(r);
+    if (cp.is_root) { if (CTX.read_only && (mask & W_OK)) return -EROFS; return 0; }
+
+    LOCK();
+    int isdir = 0, ok = 0;
+    if (vfs_dir_exists(CTX.store, CTX.view_name, cp.path, &isdir) == VFS_OK) {
+        if (isdir) ok = 1;
+        else {
+            vfs_object_id id;
+            ok = (resolve_file(&cp, &id) == 0);
+        }
+    }
+    UNLOCK();
     if (!ok) return -ENOENT;
     if (CTX.read_only && (mask & W_OK)) return -EROFS;
     return 0;
@@ -1430,16 +969,9 @@ static void pid_path(char *buf, size_t bufsz) {
 static void *op_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
     (void)conn;
     cfg->use_ino = 0;
-    /* Phase 4: short FUSE-side caches paired with LISTEN/NOTIFY-driven
-     * invalidation. Mutations elsewhere (CLI commands, other daemons)
-     * emit NOTIFY viewfs_change; the notify_loop calls
-     * fuse_invalidate_path() to drop the kernel's dentry cache for the
-     * affected directory. The 2-second timeout is a safety net for any
-     * notification that gets dropped. */
     cfg->attr_timeout     = 2.0;
     cfg->entry_timeout    = 2.0;
     cfg->negative_timeout = 1.0;
-
     CTX.fuse_handle = fuse_get_context()->fuse;
 
     char p[VFS_PATH_MAX];
@@ -1448,12 +980,9 @@ static void *op_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
     if (f) { fprintf(f, "%d\n", getpid()); fclose(f); }
 
     if (notify_thread_start(&CTX) != 0) {
-        fprintf(stderr,
-            "viewfs-fuse: notify thread failed to start; mount continues "
-            "with cache disabled\n");
+        fprintf(stderr, "viewfs-fuse: notify thread failed; cache disabled\n");
         cfg->attr_timeout = cfg->entry_timeout = cfg->negative_timeout = 0.0;
     }
-
     trace("mounted view='%s' ro=%d", CTX.view_name, CTX.read_only);
     return NULL;
 }

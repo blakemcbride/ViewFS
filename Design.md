@@ -1,5 +1,15 @@
 # ViewFS Design
 
+> **⚠ Superseded model.** This document describes the prototype's original
+> **explicit-mapping** design (one stored `mappings` row per file placement).
+> The prototype has since been rewritten to a **property-driven** model:
+> directories carry property filters and a directory's file contents are
+> *computed* (objects whose properties are a superset of the directory's
+> effective filter). There is no `mappings`/`attributes`/`tags` table. For
+> the current schema, CLI surface, and FUSE semantics, read **`Plan-rewrite.md`**
+> (authoritative) and `README.md`. The sections below remain as historical
+> design rationale for the original build.
+
 Linux FUSE 3 prototype of a view-based filesystem.
 Implementation stack: **C + libfuse3 + libpq + PostgreSQL**.
 Spec of record: `viewfs_fuse_prototype_spec.md`.

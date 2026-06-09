@@ -1,5 +1,10 @@
 # ViewFS Implementation Plan
 
+> **⚠ Superseded.** This is the phased plan for the prototype's *original*
+> explicit-mapping build. The prototype was subsequently rewritten to the
+> property-driven model; the authoritative plan for the current system is
+> **`Plan-rewrite.md`**. This file is retained as historical record.
+
 Companion to `Design.md`. Phased plan for building the prototype.
 Each phase is a single logical milestone that can be tested in isolation.
 "Acceptance" lines reference the numbered criteria in

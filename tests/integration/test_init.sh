@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
-# T1: Initializing a backing store.
-
-. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
-
+# init + status + check on a fresh, empty store.
+source "$(dirname "$0")/lib.sh"
 init_store
 
-[[ -f "$STORE/config.toml" ]] || { echo 'config.toml missing'; exit 1; }
-[[ -d "$STORE/objects"     ]] || { echo 'objects/ missing';   exit 1; }
-[[ -d "$STORE/tmp"         ]] || { echo 'tmp/ missing';       exit 1; }
-[[ -d "$STORE/daemons"     ]] || { echo 'daemons/ missing';   exit 1; }
-[[ -d "$STORE/logs"        ]] || { echo 'logs/ missing';      exit 1; }
+status=$("$VFS" status)
+assert_contains "$status" "schema_version:   1" "schema version is 1"
+assert_contains "$status" "views:            0" "no views yet"
+assert_contains "$status" "directories:      0" "no dirs yet"
 
-# schema_migrations row at the binary's expected version (currently 2)
-v=$(psql "$PG" -tAc "SELECT max(version) FROM \"$TEST_SCHEMA\".schema_migrations")
-assert_eq "$v" "2" "schema_migrations.version"
+# A fresh store is consistent.
+out=$("$VFS" check)
+assert_contains "$out" "Store is consistent." "fresh store consistent"
+
+echo "PASS: test_init"

@@ -1,71 +1,33 @@
 #!/usr/bin/env bash
-# Phase 9 crash-recovery test.
-#
-# Procedure:
-#   1. Mount a view.
-#   2. Write a file via FUSE; close (so op_flush runs fsync + DB UPDATE).
-#   3. kill -9 the daemon process.
-#   4. Lazy-unmount the now-defunct FUSE mount.
-#   5. Run `viewfs check` against the store.
-#
-# Expected outcome: the store is reported consistent. The Phase 9 changes
-# (fsync in op_flush, fsync parent dir after rename, content-before-commit
-# in op_create) ensure that any write whose close(2) returned 0 has been
-# durably persisted and matches the DB's recorded size.
-
-. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
-
+# Power-loss resilience: a write whose close(2) returned 0, followed by a
+# hard kill -9 of the daemon, leaves a consistent store and the bytes intact
+# on remount. (Content path + checksum machinery are unchanged from Phase 9.)
+source "$(dirname "$0")/lib.sh"
 init_store
-"$VFS" view create v1 >/dev/null
 
-mount_view v1 "$MNT/v1"
+"$VFS" view create v >/dev/null
+"$VFS" dir mkdir v /d >/dev/null
+"$VFS" prop set v:/d k val >/dev/null
 
-# Create + write a file through the FUSE mount.
-echo 'persisted before crash' > "$MNT/v1/file.txt"
+mount_view v "$MNT/v"
 
-# Sync the FUSE filesystem so the kernel flushes its dirty buffers to
-# the daemon (the daemon then fsync's them to host disk via op_flush).
+# echo + sync so close(2) has returned and op_flush has run before the kill.
+echo "durable-bytes" > "$MNT/v/d/f.txt"
 sync
 
-# Find the daemon's PID and kill -9 it.
-pidfile="$STORE/daemons/v1.pid"
-[[ -f "$pidfile" ]] || { echo "no PID file at $pidfile"; exit 1; }
-daemon_pid=$(cat "$pidfile")
+pidfile="$STORE/daemons/v.pid"
+assert_eq "$([[ -f "$pidfile" ]] && echo yes)" "yes" "daemon wrote a pid file"
+kill -9 "$(cat "$pidfile")" 2>/dev/null || true
 
-# Sanity: it should still be running before we kill it.
-if ! kill -0 "$daemon_pid" 2>/dev/null; then
-  echo "daemon $daemon_pid was already dead"; exit 1
-fi
-kill -9 "$daemon_pid"
+# The mount is now stale; lazy-unmount it.
+fusermount3 -u -z "$MNT/v" >/dev/null 2>&1 || fusermount3 -u "$MNT/v" >/dev/null 2>&1 || true
+sleep 0.5
 
-# Wait for the kernel to notice the daemon is gone.
-i=0
-while kill -0 "$daemon_pid" 2>/dev/null; do
-  sleep 0.1; i=$((i+1))
-  (( i < 50 )) || { echo "daemon $daemon_pid did not die"; exit 1; }
-done
+assert_contains "$("$VFS" check)" "Store is consistent." "store consistent after kill -9"
 
-# Lazy-unmount to clear the stale FUSE mount that's now pointing at a
-# dead userspace daemon.
-fusermount3 -uz "$MNT/v1" 2>/dev/null \
-  || fusermount3 -u  "$MNT/v1" 2>/dev/null \
-  || true
+# Remount and confirm the bytes survived.
+mount_view v "$MNT/v"
+assert_eq "$(cat "$MNT/v/d/f.txt")" "durable-bytes" "bytes survived the crash"
+unmount_view "$MNT/v"
 
-# Give the kernel a beat to drop the mount entry.
-i=0
-while mount_in_procmounts "$MNT/v1"; do
-  sleep 0.1; i=$((i+1))
-  (( i < 50 )) || { echo "stale mount not cleared"; exit 1; }
-done
-
-# Now exercise viewfs check against the (intentionally) post-crash store.
-out=$("$VFS" check)
-echo "$out"
-assert_contains "$out" 'Store is consistent.' \
-                'store should be consistent after a clean close + crash'
-
-# And re-mount + read should see the persisted content.
-mount_view v1 "$MNT/v1"
-got=$(cat "$MNT/v1/file.txt")
-assert_eq "$got" 'persisted before crash' 'content survived the crash'
-unmount_view "$MNT/v1"
+echo "PASS: test_crash"

@@ -12,3 +12,6 @@ viewfs-fuse
 *.swp
 *~
 .DS_Store
+
+# Generated test logs
+tests/integration/.logs/

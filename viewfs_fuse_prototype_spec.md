@@ -1,70 +1,117 @@
 # View-Based File System FUSE Prototype Specification
 
+> **Revision — property-driven model.** This specification describes the
+> prototype as it now exists: view membership is **computed from
+> properties**, not stored as explicit per-view path mappings. A directory
+> carries a set of property/value pairs (a *filter*); a file appears in a
+> directory exactly when the file's properties are a **superset** of that
+> directory's *effective* filter. An earlier revision of this document
+> specified explicit path mappings and per-view filenames; that mechanism
+> has been replaced. `Plan-rewrite.md` is the companion implementation plan.
+
 ## 1. Purpose
 
 Build a Linux FUSE prototype for a view-based file system model.
 
-The prototype shall demonstrate a file system in which users interact with named, task-specific views instead of a single fixed hierarchy. Each view presents a normal directory tree to applications, but the files visible inside that tree are only the subset assigned to that view. Existing applications shall access files through ordinary POSIX file operations without modification.
+The prototype shall demonstrate a file system in which users interact with
+named, task-specific views instead of a single fixed hierarchy. Each view
+presents a normal directory tree to applications, but the files visible
+inside a directory are computed from properties: a directory holds a set of
+property/value pairs, and the files it contains are exactly the objects whose
+properties satisfy that set. Existing applications shall access files through
+ordinary POSIX file operations without modification.
 
-This document specifies goals, functional requirements, constraints, and acceptance criteria for an initial proof-of-concept implementation. It intentionally does not prescribe a final kernel design, final on-disk format, or long-term production architecture.
+This document specifies goals, functional requirements, constraints, and
+acceptance criteria for an initial proof-of-concept implementation. It
+intentionally does not prescribe a final kernel design, final on-disk
+format, or long-term production architecture.
 
 ## 2. Background
 
-Traditional operating systems expose files primarily through a hierarchical namespace. That model has served well for decades, but becomes difficult to navigate and manage as systems contain hundreds of thousands of files. A single hierarchy is also rigid: different tasks may require different organizational structures. Symbolic links and hard links help, but they do not fully solve the problem of task-specific organization.
+Traditional operating systems expose files primarily through a hierarchical
+namespace. That model has served well for decades, but becomes difficult to
+navigate and manage as systems contain hundreds of thousands of files. A
+single hierarchy is also rigid: different tasks may require different
+organizational structures. Symbolic links and hard links help, but they do
+not fully solve the problem of task-specific organization.
 
-The proposed model introduces **views**. A view is a named, use-case-specific hierarchy containing a subset of all files known to the system. A file may appear in multiple views, may appear under different paths in different views, and may have different per-view names. Files and groups of files may have arbitrary attributes or tags, and views may use these attributes to determine membership.
+The proposed model introduces **views**. A view is a named, use-case-specific
+hierarchy. Each directory in a view carries a set of property/value pairs,
+and the files visible in that directory are computed: an object appears
+wherever its own properties are a superset of the directory's effective
+filter. A file therefore appears in any number of directories and views
+simultaneously — wherever it matches — with no copying and no stored
+placement records. The organizing act is assigning properties to objects and
+filters to directories.
 
-The FUSE prototype shall implement enough of this model to test the core user experience and semantics.
+The FUSE prototype shall implement enough of this model to test the core
+user experience and semantics.
 
 ## 3. Definitions
 
 ### 3.1 Backing Store
 
-The ordinary host directory tree used by the prototype to store real file contents and metadata.
-
-The backing store is not the user-facing filesystem. It is an implementation detail used by the prototype.
+The ordinary host directory tree used by the prototype to store real file
+contents, plus its configuration. Object and view metadata live in a
+PostgreSQL schema (see §10). The backing store is not the user-facing
+filesystem; it is an implementation detail.
 
 ### 3.2 Object
 
-A persistent file-like entity with stable identity independent of any particular view path.
-
-An object may be represented in one or more views. Multiple view paths may refer to the same object.
+A persistent file-like entity with stable identity independent of any view or
+path. An object carries content, an intrinsic display **name**, and a set of
+**properties**. The same object surfaces in every directory whose filter its
+properties satisfy.
 
 ### 3.3 View
 
-A named user-facing filesystem hierarchy.
+A named user-facing filesystem hierarchy: a tree of directories, each with an
+attached property filter. A view exposes objects through ordinary directories
+and filenames; the file contents of each directory are computed.
 
-Each view exposes a subset of objects through ordinary directories and filenames. A view may organize the same object differently than other views.
+### 3.4 Directory Filter
 
-### 3.4 View Path
+The set of property/value pairs attached to a directory. Each pair carries a
+**flow** flag (see §3.8). A directory with an empty filter matches every
+object (the empty set is a subset of everything), so a view's root and any
+freshly created directory list all objects until pairs are attached.
 
-The path of a file or directory as it appears inside a specific view.
+### 3.5 Property
 
-The same object may have different view paths in different views.
-
-### 3.5 Attribute
-
-A key-value metadata item associated with an object.
-
-Attributes may be used to select objects for a view.
+A `(key, value)` metadata pair associated with an object. Properties are
+**multi-valued**: a key may hold several values on one object. Properties are
+the sole driver of view membership.
 
 ### 3.6 Tag
 
-A shorthand form of attribute used for classification.
+A shorthand for a property whose key is `tag`. A tag is not a separate kind
+of metadata; `tag=draft` is an ordinary property.
 
-A tag may be represented internally as an attribute with a boolean or set value.
+### 3.7 Effective Filter
 
-### 3.7 Active View
+The filter actually applied to a directory: its own pairs plus every pair on
+an ancestor directory that is marked to flow (§3.8). An object is a member of
+a directory iff its property set is a superset of the directory's effective
+filter (relational division: the object has every required pair, possibly
+more).
 
-The view currently exposed at a mounted FUSE mount point.
+### 3.8 Flow
 
-A process using that mount point shall only see files and directories visible in that view.
+A boolean on each directory-filter pair. A pair with `flow = false` (the
+default) constrains only its own directory (independent nesting). A pair with
+`flow = true` also applies to all descendant directories, making each
+descendant a strict subset of the ancestor (cumulative nesting).
 
-### 3.8 Source Path
+### 3.9 Active View
 
-The original or backing-store path associated with an object, if any.
+The view currently exposed at a mounted FUSE mount point. A process using
+that mount point shall only see objects whose properties match the
+directories of that view.
 
-The source path is not necessarily visible inside a view.
+### 3.10 Source Path
+
+The original host path an object was imported from, if any. Informational;
+not visible inside a view.
 
 ## 4. Project Scope
 
@@ -75,16 +122,19 @@ The prototype shall include:
 1. A FUSE filesystem mountable on Linux.
 2. Support for multiple named views.
 3. Normal directory traversal within a mounted active view.
-4. File visibility limited to the active view.
-5. File identity independent of view path.
-6. The ability for one file object to appear in multiple views.
-7. The ability for one file object to have different names or paths in different views.
-8. Persistent view definitions.
-9. Persistent object metadata.
-10. Persistent per-view path mappings.
-11. Basic file operations through POSIX-compatible interfaces.
-12. A simple command-line administration tool.
-13. Tests demonstrating the required behavior.
+4. File visibility computed from properties and per-directory filters.
+5. File identity independent of view, directory, and name.
+6. The ability for one object to appear in multiple directories and views
+   at once, by property match.
+7. Per-directory property filters, with a per-pair flow flag for cumulative
+   nesting.
+8. Multi-valued object properties.
+9. Persistent view, directory, filter, object, and property metadata.
+10. Basic file operations through POSIX-compatible interfaces, including
+    create (assigning the directory's properties) and move (swapping the
+    source directory's pairs for the destination's).
+11. A command-line administration tool.
+12. Tests demonstrating the required behavior.
 
 ### 4.2 Out of Scope for Initial Prototype
 
@@ -99,809 +149,643 @@ The initial prototype shall not attempt to implement:
 7. Network filesystem support.
 8. Distributed synchronization.
 9. Multi-host consistency.
-10. Full crash-consistency guarantees beyond ordinary safe metadata writes.
-11. Quotas.
-12. Snapshots.
-13. Deduplication.
-14. Compression.
-15. Encryption.
-16. File versioning.
+10. Full crash-consistency guarantees beyond ordinary safe metadata writes
+    and `close(2)`-completed content writes.
+11. Quotas. 12. Snapshots. 13. Deduplication. 14. Compression.
+15. Encryption. 16. File versioning.
 17. High-performance indexing for very large repositories.
 18. Inotify correctness beyond what FUSE naturally provides.
 19. Hard link semantic equivalence across all edge cases.
 20. Production-grade package management.
+21. A declarative view rule language beyond property-pair filters with flow.
 
 ## 5. Prototype Goals
 
 The implementation shall demonstrate the following concepts:
 
-1. A user can define multiple named views.
+1. A user can define multiple named views, each a tree of directories with
+   property filters.
 2. A user can mount one view and interact with it as a normal filesystem.
-3. A program using ordinary file operations sees only the files exposed by the mounted view.
-4. The same underlying file can appear in multiple views.
-5. The same underlying file can appear under different names or directories in different views.
-6. Adding, renaming, removing, or moving files within a view persists in that view.
-7. View metadata survives unmount and remount.
-8. Attribute or tag metadata can be assigned to files.
-9. View membership can be inspected and changed through an administration tool.
+3. A program using ordinary file operations sees only the objects whose
+   properties match the mounted view's directories.
+4. The same object appears in every directory and view whose filter it
+   satisfies — no copies, no stored placement.
+5. A directory filter pair can flow to descendants, making a child a strict
+   subset of its parent.
+6. Creating a file inside a directory gives the new object that directory's
+   effective properties; moving a file swaps the source directory's pairs
+   for the destination's; both persist.
+7. View, directory, filter, object, and property metadata survive unmount
+   and remount.
+8. Multi-valued properties can be assigned to objects and queried.
+9. Membership can be inspected and changed through an administration tool by
+   editing directory filters or object properties.
 
 ## 6. Non-Goals
 
-The prototype shall not claim that FUSE alone provides complete process security against all possible host filesystem access. The prototype only restricts access through the mounted FUSE view. A process that also has direct access to the backing store or other host paths may still access those paths through ordinary operating system mechanisms.
+The prototype shall not claim that FUSE alone provides complete process
+security against all possible host filesystem access. It only restricts
+access through the mounted FUSE view. A process that also has direct access
+to the backing store, or that can connect to the PostgreSQL role, may access
+those resources through ordinary mechanisms.
 
-The prototype shall not attempt to replace mount namespaces, containers, chroot, SELinux, AppArmor, or kernel-enforced sandboxing.
-
-The prototype shall not define the final design of a future Linux VFS extension.
-
-The prototype shall not require changes to existing application source code.
+The prototype shall not attempt to replace mount namespaces, containers,
+chroot, SELinux, AppArmor, or kernel-enforced sandboxing. It shall not define
+the final design of a future Linux VFS extension, and shall not require
+changes to existing application source code.
 
 ## 7. User-Facing Behavior
 
 ### 7.1 Mounting a View
 
-The user shall be able to mount a named view at a mount point.
-
-Example command shape:
+The user shall be able to mount a named view at a mount point:
 
 ```sh
 viewfs mount programming ~/mnt/programming
 ```
 
-After mounting, ordinary shell commands shall work:
-
-```sh
-cd ~/mnt/programming
-ls
-cat README.md
-mkdir src
-cp ~/some/file.c src/file.c
-```
-
-The exact command names may vary, but the functionality shall exist.
+After mounting, ordinary shell commands shall work (`cd`, `ls`, `cat`,
+`mkdir`, `cp`, `mv`, `rm`, …).
 
 ### 7.2 View Isolation
 
-When a view is mounted, directory listings shall show only directories and files mapped into that view.
-
-A file not present in the active view shall not be visible via `readdir`.
-
-A file not present in the active view shall not be openable by guessing its backing-store path through the mounted view.
-
-A path traversal attempt using `..` shall not escape the mounted view.
+When a view is mounted, a directory listing shall show that directory's child
+directories plus the objects whose properties satisfy the directory's
+effective filter. An object that does not match shall not be visible via
+`readdir`, and shall not be openable by guessing a backing-store path. A `..`
+traversal attempt shall not escape the mounted view.
 
 ### 7.3 Normal File Access
 
-Existing programs shall be able to use the mounted view with ordinary file operations:
-
-1. `open`
-2. `read`
-3. `write`
-4. `close`
-5. `stat`
-6. `rename`
-7. `unlink`
-8. `mkdir`
-9. `rmdir`
-10. `truncate`
-11. `fsync`, at least as a best-effort pass-through operation
-
-The prototype shall expose behavior close enough to a normal POSIX filesystem for basic command-line tools to work.
+Existing programs shall be able to use the mounted view with ordinary file
+operations: `open`, `read`, `write`, `close`, `stat`, `rename`, `unlink`,
+`mkdir`, `rmdir`, `truncate`, and `fsync` (at least best-effort). The
+prototype shall expose behavior close enough to a normal POSIX filesystem for
+common command-line tools to work.
 
 ### 7.4 Multiple Views
 
-The system shall support multiple named views.
+The system shall support multiple named views, mountable at different mount
+points simultaneously. The same object may appear in multiple views — wherever
+its properties match each view's directory filters. A content change to a
+shared object through one view shall be visible through another view after
+ordinary cache effects resolve.
 
-Different views may be mounted at different mount points at the same time.
+### 7.5 Names and Cross-View Appearance
 
-Example command shape:
+An object has a single intrinsic name. It appears under that name in every
+directory it matches, in every view. Different views surface the same object
+through different *filters*, not different names.
 
-```sh
-viewfs mount programming ~/mnt/programming
-viewfs mount writing ~/mnt/writing
-```
-
-The same object may appear in both views.
-
-Changes to the content of a shared object through one view shall be visible through another view after ordinary filesystem cache effects are resolved.
-
-### 7.5 Per-View Naming
-
-The same object may appear under different paths in different views.
-
-Example:
-
-```text
-programming:/projects/tool/README.md
-writing:/articles/tool-notes.md
-```
-
-Both paths may refer to the same underlying object.
-
-Changing file content through either path shall change the same object.
-
-Renaming a file in one view shall change that view's path mapping only unless the implementation explicitly performs an object-level operation requested by the administration tool.
+When two distinct objects share a name within one directory, the mount shall
+keep them individually addressable — e.g. by suffixing the displayed name
+with a short object-id prefix (`report.txt~a1f8`). A uniquely-named object is
+shown bare.
 
 ### 7.6 Adding Files Through a View
 
-When a user creates a new file inside a mounted view, the prototype shall:
+When a user creates a new file inside a directory of a mounted view, the
+prototype shall:
 
-1. Create a new object.
-2. Store the file contents in the backing store.
-3. Add a path mapping for the new object in the active view.
-4. Persist the mapping.
-5. Ensure the new file is visible after unmount and remount of the same view.
+1. Create a new object and store its content in the backing store.
+2. Assign the directory's **effective** property pairs to the new object, so
+   it satisfies that directory's filter and appears there.
+3. Persist the object and its properties.
+4. Ensure the new file is visible after unmount and remount.
 
-The new object shall not automatically appear in unrelated views unless the user or view rules require it.
+A copy (`cp`) of an external file into a directory behaves the same way: a new
+object that takes on the destination directory's pairs. The new object shall
+not appear in unrelated directories unless its properties also match them.
 
 ### 7.7 Removing Files Through a View
 
-When a user deletes a file path from a mounted view, the default behavior shall remove that path mapping from the active view.
+When a user deletes a file through a mounted view (`unlink`), the prototype
+shall delete the object and its content. Because membership is computed, the
+object then disappears from every directory and view at once.
 
-If the object appears in other views, the object and its content shall remain available through those other views.
-
-If the removed path was the object's last view mapping, the prototype shall either:
-
-1. Mark the object as orphaned but preserve its content, or
-2. Delete the object content only if an explicit configured policy says to do so.
-
-For the initial prototype, the safer default shall be to preserve orphaned content.
+To remove a file from one directory **without** destroying it, the user shall
+instead change the object's properties (via the administration tool, or by
+`mv` to a directory whose filter it no longer matches) so it stops matching
+that directory. The administration tool shall also provide explicit object
+deletion and a way to list objects that match nothing meaningful (§15.3).
 
 ### 7.8 Renaming and Moving Files Within a View
 
-Renaming or moving a file inside a view shall update that view's path mapping.
+Moving a file from one directory to another (`mv`) shall keep the same object
+and shall: remove the source directory's effective pairs from the object, add
+the destination directory's effective pairs, and retain all other properties.
+The object's name shall become the destination basename. Object identity is
+preserved; content is untouched.
 
-The object identity shall remain the same.
+Because membership is global to a view, a move may change where the object
+appears in other directories too (any directory defined by the swapped pairs)
+— this follows directly from the model and is intended.
 
-Other views' mappings shall not be changed by default.
+Renaming a directory shall move that directory's subtree, carrying its filter
+pairs (and all descendants') with it.
 
 ### 7.9 Directories
 
-Directories in a view may be:
+Directories are **explicit**, first-class rows forming a per-view tree with a
+single root. `mkdir` creates a directory with an **empty** filter; the
+administration tool attaches property pairs to it. `mkdir` and `rmdir` through
+the mount persist in the active view. `rmdir` shall succeed only when the
+directory has no child directories **and** no matching files (an empty filter
+matches everything, so a directory must narrow its filter to nothing — or the
+store must be empty — before it is removable). The README documents this.
 
-1. Explicitly persisted as directory mappings, or
-2. Implied by file path mappings.
+### 7.10 Properties and Tags
 
-The behavior shall be consistent and documented in the implementation README.
+The prototype shall allow arbitrary, multi-valued properties to be associated
+with objects. Minimum required operations:
 
-Directory creation through `mkdir` shall persist in the active view.
+1. Add a `(key, value)` pair to an object.
+2. List an object's properties.
+3. Remove a single value, or all values, of a key.
+4. List objects matching one or more property pairs.
 
-Directory removal through `rmdir` shall succeed only when the directory is empty in that view.
-
-### 7.10 Attributes and Tags
-
-The prototype shall allow arbitrary attributes or tags to be associated with objects.
-
-Minimum required operations:
-
-1. Set an attribute.
-2. Get attributes for an object.
-3. Remove an attribute.
-4. List objects matching an attribute.
-5. Add a tag.
-6. Remove a tag.
-7. List tags for an object.
-
+A tag is a property with key `tag`; no separate tag commands are required.
+The same `prop` command shall manage properties on a file (object) and the
+filter on a directory; the *target* distinguishes them (an object id, a
+`VIEW:DIR`, or a path/name resolved against the current directory in a mount).
 Example command shapes:
 
 ```sh
-viewfs tag add OBJECT_ID project:compiler
-viewfs tag remove OBJECT_ID project:compiler
-viewfs attr set OBJECT_ID language C
-viewfs attr get OBJECT_ID
-viewfs find --tag project:compiler
-viewfs find --attr language=C
+viewfs prop set    TARGET language C      # TARGET = object id, VIEW:DIR, or path
+viewfs prop list   TARGET
+viewfs prop unset  TARGET language
+viewfs find --prop language=C
+viewfs find --prop tag=draft --prop author=blake   # AND across pairs
 ```
 
-The exact command syntax may vary.
+### 7.11 Membership Management
 
-### 7.11 View Membership Management
-
-The prototype shall provide a way to add or remove an object from a view.
-
-Example command shapes:
+Membership is changed by editing directory filters or object properties — not
+by adding/removing placement rows. The administration tool shall provide:
 
 ```sh
-viewfs view add programming OBJECT_ID /src/main.c
-viewfs view remove programming /src/main.c
+viewfs dir mkdir   VIEW DIR
+viewfs dir rmdir   VIEW DIR
+viewfs dir ls      VIEW DIR             # computed contents
+viewfs prop set    VIEW:DIR KEY VALUE [--flow]   # attach a filter pair
+viewfs prop unset  VIEW:DIR KEY [VALUE]
+viewfs prop list   VIEW:DIR [--effective]
 ```
 
-When adding an object to a view, the user shall be able to choose the view path.
-
-When removing an object from a view, only the selected view mapping shall be removed by default.
+To make an object appear in `VIEW:DIR`, give it that directory's pairs — by
+setting properties directly, or via `object import --into VIEW:DIR`, which
+assigns the directory's effective pairs to the imported object.
 
 ### 7.12 View Listing and Inspection
 
 The administration tool shall support:
 
-1. Listing all views.
-2. Creating a view.
-3. Deleting a view.
-4. Showing a view's mappings.
-5. Showing all paths for a given object across views.
-6. Showing object metadata.
-
-Example command shapes:
-
 ```sh
 viewfs view list
-viewfs view create programming
-viewfs view delete programming
-viewfs view show programming
+viewfs view create VIEW [DESCRIPTION]
+viewfs view delete VIEW
+viewfs view show   VIEW           # the directory tree
 viewfs object show OBJECT_ID
-viewfs object paths OBJECT_ID
+viewfs object name OBJECT_ID [NEWNAME]
 ```
+
+There is no "paths for an object across views" command, because an object's
+locations are computed; `viewfs dir ls` and `viewfs find --prop` answer
+"where does this appear" by query.
 
 ## 8. View Definition Requirements
 
-### 8.1 Explicit Mappings
+### 8.1 Property-Driven Membership
 
-The prototype shall support explicit path mappings from a view path to an object.
+The prototype's view-definition mechanism is the **directory filter**: each
+directory carries a set of `(key, value, flow)` pairs. A directory's file
+members are exactly the objects whose properties are a superset of the
+directory's effective filter (own pairs plus flowed ancestor pairs). There is
+no explicit per-file placement table; membership is always computed.
 
-This is the minimum required view definition mechanism.
+A directory record shall include its view, canonical directory path, parent
+path, name, mode bits, and timestamps. A filter pair shall include its view,
+directory path, key, value, flow flag, and timestamps.
 
-A mapping shall include:
+### 8.2 Multi-Valued and Flow Semantics
 
-1. View name.
-2. View path.
-3. Object ID.
-4. File type, if needed.
-5. Timestamp metadata sufficient for display and synchronization.
+A directory may list several values for one key (the object must have all of
+them — AND). A pair marked `flow` applies to descendant directories,
+expressing cumulative nesting; unmarked pairs are independent. Both forms
+shall be supported and shall be inspectable (`prop list VIEW:DIR --effective`
+shows inherited pairs and their source directory).
 
-### 8.2 Attribute-Based Membership
+### 8.3 Membership Is Dynamic
 
-The prototype shall include at least a minimal mechanism for selecting or listing objects by attributes or tags.
-
-For the initial implementation, attribute-based membership may be implemented as an administration-tool operation that materializes explicit mappings into a view.
-
-Example:
-
-```sh
-viewfs view populate programming --tag project:compiler --under /project
-```
-
-This command may create explicit mappings for all matching objects.
-
-The prototype does not need to implement a complex live query language for view membership unless doing so is simpler than materialized mappings.
-
-### 8.3 Future Rule Language Placeholder
-
-The implementation shall leave room for future declarative view rules, but the initial prototype shall not depend on a sophisticated rule language.
-
-The README shall state whether view membership is:
-
-1. Fully explicit,
-2. Materialized from attributes,
-3. Dynamically queried from attributes, or
-4. A combination.
+The README shall state that view membership is **dynamically computed from
+object properties and per-directory filters** (it is option 3 — "dynamically
+queried from attributes" — of the earlier revision's enumeration). No
+materialization step is required; editing a property or a filter changes
+membership immediately.
 
 ## 9. Object Identity Requirements
 
-Each object shall have a stable internal identifier.
-
-Object identity shall not depend on:
-
-1. Backing-store path.
-2. View name.
-3. View path.
-4. Current filename.
-5. Current parent directory.
-
-The prototype shall be able to report an object's ID through the administration tool.
-
-It is acceptable for the FUSE mount to expose ordinary inode numbers that are derived from object IDs, provided the behavior is stable enough for normal tools.
+Each object shall have a stable internal identifier that does not depend on
+backing-store path, view, directory, name, or properties. The administration
+tool shall report an object's ID. Each object also has an intrinsic display
+name, which may be changed without affecting identity. It is acceptable for
+the FUSE mount to expose inode numbers derived per-mount, provided behavior is
+stable enough for normal tools.
 
 ## 10. Storage Requirements
 
 ### 10.1 Backing Store Layout
 
-The implementation shall maintain a backing store directory containing:
-
-1. File contents.
-2. Object metadata.
-3. View definitions.
-4. View path mappings.
-5. Attribute and tag metadata.
-
-The backing store location shall be configurable.
-
-Example command shape:
+The backing store directory shall contain file contents and configuration.
+Object, property, view, directory, and filter metadata are held in PostgreSQL.
+The backing store location shall be configurable:
 
 ```sh
-viewfs init ~/.local/share/viewfs
+viewfs init STORE_PATH
 ```
+
+`viewfs init` shall create the PostgreSQL database if it does not already
+exist (connecting to a maintenance database to issue `CREATE DATABASE`),
+provided the connecting role has the privilege to do so, and then create the
+schema and apply migrations. Tearing the system down (the `DestroyAll.sh` helper)
+correspondingly drops the whole database.
 
 ### 10.2 Metadata Persistence
 
-Metadata shall survive:
-
-1. Unmounting a view.
-2. Remounting a view.
-3. Restarting the FUSE daemon.
-4. Rebooting the system, assuming the backing store is persistent.
+Metadata shall survive unmounting, remounting, restarting the FUSE daemon,
+and rebooting (assuming the backing store and database are persistent).
 
 ### 10.3 Metadata Format
 
-The prototype may use any simple local metadata store, such as:
-
-1. SQLite,
-2. JSON files,
-3. TOML/YAML files,
-4. A small embedded database.
-
-The chosen format shall be documented.
-
-The implementation shall avoid requiring an external database server.
+Metadata is stored in **PostgreSQL** via libpq, in a single configurable
+schema. (This revises the earlier prototype guidance, which suggested a
+local embedded store and avoiding a database server; the implementation uses
+PostgreSQL for its indexed relational-division membership queries and
+`LISTEN/NOTIFY` cache invalidation.) The schema is documented in
+`src/libviewfs/migrations/0001_init.sql` and explained in `Plan-rewrite.md`.
 
 ### 10.4 Content Storage
 
-File contents shall be stored under the backing store.
-
-The implementation shall avoid exposing backing-store internals through mounted views.
-
-A reasonable prototype approach is content files named by object ID.
+File contents shall be stored under the backing store, named by object ID and
+sharded one level by the first two hex characters of the ID. The sharded
+layout shall never be exposed through a mounted view.
 
 ## 11. Security Requirements
 
 ### 11.1 Mounted View Boundary
 
-The FUSE filesystem shall not expose objects outside the active view through normal mounted-path operations.
-
-The implementation shall defend against:
-
-1. `..` traversal escaping the view.
-2. Symlink traversal escaping the view when symlink support is implemented.
-3. Absolute backing-store paths being interpreted as view paths.
-4. Path normalization bugs.
-5. Opening unmapped objects through guessed names.
+The FUSE filesystem shall not expose, through normal mounted-path operations,
+objects that do not match the active view's directories. The implementation
+shall defend against `..` traversal escaping the view, escaping symlink
+traversal (where symlinks are implemented), absolute backing-store paths
+being interpreted as view paths, path-normalization bugs, and opening
+unmatched objects through guessed names.
 
 ### 11.2 Backing Store Protection
 
-The README shall warn that users must not give sandboxed processes direct access to the backing store if they want view isolation.
-
-The prototype shall assume that the backing store is trusted and controlled by the user running the FUSE daemon.
+The README shall warn that users must not give sandboxed processes direct
+access to the backing store or to the PostgreSQL role if they want view
+isolation. The backing store and database role are assumed trusted and
+controlled by the user running the FUSE daemon.
 
 ### 11.3 Process-Level Isolation Limits
 
-The prototype shall clearly document that FUSE view isolation applies to accesses through the FUSE mount only.
-
-For stronger process isolation, the README shall recommend combining the mounted view with existing Linux mechanisms such as:
-
-1. Mount namespaces,
-2. Containers,
-3. `chroot` where appropriate,
-4. Bubblewrap or similar user-space sandboxing tools,
-5. SELinux/AppArmor if later integrated.
-
-The implementation itself does not need to configure these mechanisms.
+The README shall document that FUSE view isolation applies to accesses through
+the FUSE mount only, and shall recommend combining the mount with mount
+namespaces, containers, `chroot`, bubblewrap, or SELinux/AppArmor for stronger
+isolation. The implementation need not configure these.
 
 ### 11.4 Permissions
 
-The prototype shall support basic POSIX mode bits for files and directories.
-
-Minimum behavior:
-
-1. Store mode bits for objects or mappings.
-2. Return mode bits through `getattr`.
-3. Respect read-only versus writable files where practical.
-4. Preserve executable bits.
-
-It is acceptable for ownership to be simplified to the user running the FUSE daemon in the initial prototype.
+The prototype shall support basic POSIX mode bits for files (on objects) and
+directories (on directory rows): store them, return them through `getattr`,
+respect read-only mounts, and preserve executable bits. Ownership may be
+simplified to the invoking user in the initial prototype.
 
 ## 12. FUSE Operation Requirements
 
-The prototype shall implement enough FUSE callbacks to support common shell and editor usage.
-
 ### 12.1 Required Operations
 
-The implementation shall support:
-
-1. `getattr`
-2. `readdir`
-3. `open`
-4. `read`
-5. `write`
-6. `create`
-7. `mkdir`
-8. `unlink`
-9. `rmdir`
-10. `rename`
-11. `truncate`
-12. `utimens`
-13. `flush` or equivalent
-14. `fsync` or documented best-effort behavior
-15. `release`
+`getattr`, `readdir`, `open`, `read`, `write`, `create`, `mkdir`, `unlink`,
+`rmdir`, `rename`, `truncate`, `utimens`, `flush` (or equivalent), `fsync`
+(or documented best-effort), `release`.
 
 ### 12.2 Recommended Operations
 
-The implementation should support:
-
-1. `statfs`
-2. `chmod`
-3. `chown`, even if simplified
-4. `readlink`
-5. `symlink`
-6. Extended attributes, if convenient
-7. `access`
+`statfs`, `chmod`, `chown` (even if simplified), `readlink`, `symlink`,
+extended attributes, `access`. Extended attributes under `user.viewfs.` map
+onto object properties; through xattrs a key is single-valued (set replaces
+all values of the key).
 
 ### 12.3 Path Resolution
 
-All FUSE path resolution shall be relative to the active view.
-
-The implementation shall canonicalize paths before lookup.
-
-Canonicalization shall reject or normalize:
-
-1. Duplicate slashes.
-2. `.` components.
-3. `..` components.
-4. Empty path components except root.
-5. Invalid or unsupported filenames.
+All path resolution shall be relative to the active view and canonicalized
+before lookup. Canonicalization shall normalize or reject duplicate slashes,
+`.` components, `..` components (no escape past root), empty components except
+root, and invalid filenames. A canonical directory path resolves to a
+directory row; otherwise the final component is matched as an object name
+among the parent directory's members (honoring the `name~idprefix`
+disambiguation form of §7.5).
 
 ### 12.4 Error Behavior
 
-The filesystem shall return normal POSIX-style errors.
-
-Examples:
-
-1. `ENOENT` for paths not visible in the active view.
-2. `EEXIST` when creating a mapping that already exists.
-3. `ENOTDIR` when a path component is not a directory.
-4. `EISDIR` when reading a directory as a file.
-5. `ENOTEMPTY` when removing a non-empty directory.
-6. `EACCES` for permission failures.
-7. `EROFS` if mounted read-only and a write is attempted.
+Normal POSIX-style errors: `ENOENT` for paths not matching the active view,
+`EEXIST` when creating a directory that already exists, `ENOTDIR`/`EISDIR` as
+appropriate, `ENOTEMPTY` when removing a directory that has child dirs or
+matching files, `EACCES` for permission failures, `EROFS` on a read-only
+mount.
 
 ## 13. Command-Line Tool Requirements
 
-The project shall provide a command-line tool, named `viewfs` unless another name is chosen consistently.
+The project shall provide a tool named `viewfs`. It shall support at least:
 
-The tool shall support at least the following conceptual operations.
-
-### 13.1 Repository Commands
+### 13.1 Repository
 
 ```sh
 viewfs init STORE_PATH
 viewfs status
+viewfs check
 ```
 
-### 13.2 View Commands
+### 13.2 Views
 
 ```sh
-viewfs view create VIEW_NAME
+viewfs view create VIEW [DESCRIPTION]
 viewfs view list
-viewfs view delete VIEW_NAME
-viewfs view show VIEW_NAME
+viewfs view delete VIEW
+viewfs view show   VIEW
 ```
 
-### 13.3 Mount Commands
+### 13.3 Mounting
 
 ```sh
-viewfs mount VIEW_NAME MOUNTPOINT
-viewfs unmount MOUNTPOINT
+viewfs mount   VIEW MOUNTPOINT [--ro] [--foreground] [--verbose]
+viewfs unmount MOUNTPOINT          # may wrap fusermount3 -u
 ```
 
-The unmount command may wrap `fusermount3 -u`.
-
-### 13.4 Object Commands
+### 13.4 Directories
 
 ```sh
-viewfs object import SOURCE_PATH
-viewfs object show OBJECT_ID
-viewfs object paths OBJECT_ID
-viewfs object list
+viewfs dir mkdir   [VIEW] DIR
+viewfs dir rmdir   [VIEW] DIR
+viewfs dir ls      [[VIEW] DIR]
 ```
 
-Importing a file shall create an object in the backing store.
+Directory *filters* are managed with `prop` (§13.6), addressing the directory
+as `VIEW:DIR` (or by path/cwd inside a mount).
 
-### 13.5 Mapping Commands
+### 13.5 Objects
 
 ```sh
-viewfs view add VIEW_NAME OBJECT_ID VIEW_PATH
-viewfs view remove VIEW_NAME VIEW_PATH
+viewfs object import SOURCE_PATH [--name NAME] [--into VIEW:DIR]...
+viewfs object show   OBJECT_ID
+viewfs object name   OBJECT_ID [NEWNAME]
+viewfs object copy   OBJECT_ID VIEW:DIR
+viewfs object id     VIEW VIEW_PATH
+viewfs object list   [--orphaned]
+viewfs object delete OBJECT_ID
+viewfs object delete --orphaned [--dry-run]
 ```
 
-### 13.6 Attribute Commands
+### 13.6 Properties (files and directory filters)
+
+`TARGET` is an object id, a `VIEW:DIR`, or — inside a mount — a path/name
+(or omitted, meaning the current directory). `--flow`/`--effective` apply to
+directory targets only.
 
 ```sh
-viewfs attr set OBJECT_ID KEY VALUE
-viewfs attr get OBJECT_ID
-viewfs attr remove OBJECT_ID KEY
-```
-
-### 13.7 Tag Commands
-
-```sh
-viewfs tag add OBJECT_ID TAG
-viewfs tag remove OBJECT_ID TAG
-viewfs tag list OBJECT_ID
-viewfs find --tag TAG
-viewfs find --attr KEY=VALUE
+viewfs prop set    TARGET KEY VALUE [--flow]
+viewfs prop unset  TARGET KEY [VALUE]
+viewfs prop list   [TARGET] [--effective]
+viewfs find --prop KEY[=VALUE] [--prop KEY[=VALUE]]...
 ```
 
 ## 14. Data Model Requirements
 
-The implementation shall maintain equivalent information to the following conceptual entities.
+The implementation shall maintain equivalent information to the following
+entities.
 
 ### 14.1 Object Record
 
-Each object record shall contain:
+Object ID; file type (`file`/`symlink`); intrinsic name; content reference;
+size; created/modified/accessed timestamps; mode bits; optional owner/group;
+optional checksum (and resumable checksum state); optional source path;
+symlink target (for symlinks).
 
-1. Object ID.
-2. File type.
-3. Content storage reference.
-4. Size.
-5. Created timestamp.
-6. Modified timestamp.
-7. Mode bits.
-8. Optional owner/group fields.
-9. Optional checksum field.
+### 14.2 Property Record
 
-### 14.2 View Record
+Object ID; key; value; timestamps. Multi-valued: the primary key includes the
+value, so a key may carry several values per object.
 
-Each view record shall contain:
+### 14.3 View Record
 
-1. View ID or name.
-2. Created timestamp.
-3. Modified timestamp.
-4. Optional description.
+View name; created/modified timestamps; optional description.
 
-### 14.3 Mapping Record
+### 14.4 Directory Record
 
-Each mapping record shall contain:
+View name; canonical directory path; parent path; name; mode bits;
+created/modified timestamps. Directories form a per-view tree with a single
+root.
 
-1. View name or ID.
-2. Normalized view path.
-3. Object ID, for files.
-4. Directory marker, for explicit directories if used.
-5. Per-view display name implied by path.
-6. Created timestamp.
-7. Modified timestamp.
+### 14.5 Directory Filter Record
 
-### 14.4 Attribute Record
-
-Each attribute record shall contain:
-
-1. Object ID.
-2. Key.
-3. Value.
-4. Created timestamp.
-5. Modified timestamp.
-
-### 14.5 Tag Record
-
-Each tag record shall contain:
-
-1. Object ID.
-2. Tag string.
-3. Created timestamp.
+View name; directory path; key; value; flow flag; timestamps. Referenced to
+its directory; deleting or renaming the directory cascades to its filter
+pairs.
 
 ## 15. Consistency Requirements
 
 ### 15.1 Shared Object Content
 
-If the same object appears in multiple views, all view paths shall reference the same content.
+If an object matches multiple directories or views, all references are to the
+same content. Writing through one path updates the object; other views observe
+the updated content.
 
-Writing through one view path shall update the object content.
+### 15.2 Independent Views
 
-Other views shall observe the updated content.
+Each view's membership is a function of that view's directory filters and the
+objects' properties. Editing one view's directory filters does not change
+another view's directories. (Editing an object's properties may, however,
+change where it appears across all views — that is inherent to the model.)
 
-### 15.2 Independent View Paths
+### 15.3 Loose Objects
 
-View path mappings shall be independent by default.
-
-Renaming or moving a mapping in one view shall not rename or move mappings in other views.
-
-Deleting a mapping in one view shall not remove mappings from other views.
-
-### 15.3 Orphaned Objects
-
-The implementation shall provide a way to list objects with no view mappings.
-
-Example command shape:
+The implementation shall provide a way to list objects that carry no
+properties (and therefore match only empty-filter directories such as view
+roots):
 
 ```sh
 viewfs object list --orphaned
 ```
 
-The implementation should provide an explicit command to delete orphaned objects.
-
-Example command shape:
+It shall provide explicit object deletion; deletion of object content shall be
+explicit (`unlink` through the mount also deletes — §7.7):
 
 ```sh
 viewfs object delete OBJECT_ID
 ```
 
-Deletion of object content shall be explicit.
-
 ## 16. Logging and Diagnostics
 
-The prototype shall provide useful diagnostics for development.
-
-Requirements:
-
-1. A verbose mode for the FUSE daemon.
-2. Clear error messages from the CLI.
-3. A way to inspect the backing store status.
-4. A way to check metadata consistency.
-5. Logs sufficient to debug path resolution problems.
-
-Example command shape:
-
-```sh
-viewfs check
-```
+The prototype shall provide: a verbose mode for the FUSE daemon; clear CLI
+error messages; a way to inspect backing-store/database status (`viewfs
+status`); a metadata consistency check (`viewfs check`) covering DB integrity
+(propertyless objects, unreachable or structurally inconsistent directories,
+orphan property rows), content↔object cross-checks, schema version, and
+checksum coverage; and logs sufficient to debug path resolution.
 
 ## 17. Testing Requirements
 
-The project shall include automated tests.
+The project shall include automated tests covering at minimum:
 
-At minimum, tests shall cover:
+1. Initializing a backing store; `status`/`check` on a fresh store.
+2. Creating views and directories.
+3. Attaching directory filters, independent vs. flowed.
+4. Importing objects and assigning properties (incl. `--into`).
+5. Computed membership: superset match, multi-value AND, empty-filter
+   matches everything.
+6. `find --prop` across multiple pairs (AND).
+7. Mounting a view; listing a directory's child dirs and matching files.
+8. Confirming non-matching objects are not listed.
+9. Reading a matching file; `ENOENT` for a non-matching path.
+10. The same object surfacing in two views by property match.
+11. Writing a shared object through one view and reading it through another.
+12. Creating a file inside a directory and seeing it gain that directory's
+    properties.
+13. Moving a file between directories (property swap) and `rm` deleting the
+    object.
+14. Two same-named objects in one directory remaining individually
+    addressable (`name~idprefix`).
+15. Persistence of views, directories, filters, and properties across
+    unmount and remount.
+16. `viewfs check` detecting a deleted content file.
+17. Power-loss resilience: after a `close(2)` and a hard kill of the daemon,
+    the store is consistent and the bytes survive remount.
+18. `..` traversal handled safely.
 
-1. Initializing a backing store.
-2. Creating views.
-3. Importing objects.
-4. Adding an object to one view.
-5. Adding the same object to two views.
-6. Assigning different paths to the same object in different views.
-7. Mounting a view.
-8. Listing visible files.
-9. Confirming invisible files are not listed.
-10. Reading a visible file.
-11. Attempting to read a non-visible file and receiving `ENOENT`.
-12. Writing a shared object through one view and reading the change through another view.
-13. Renaming a file in one view without affecting another view.
-14. Removing a file from one view without deleting the object from another view.
-15. Persisting view mappings across unmount and remount.
-16. Setting and retrieving attributes.
-17. Setting and retrieving tags.
-18. Finding objects by tag.
-19. Finding objects by attribute.
-20. Handling `..` traversal safely.
-
-Tests may use temporary directories and temporary FUSE mount points.
+Tests may use temporary directories, an isolated PostgreSQL schema, and
+temporary FUSE mount points.
 
 ## 18. Demonstration Scenario
 
-The completed prototype shall include a scripted demonstration.
+The completed prototype shall include a scripted demonstration that:
 
-The demonstration shall:
-
-1. Initialize a new backing store.
-2. Create at least two views:
-   - `programming`
-   - `writing`
-3. Import at least three files.
-4. Add one file only to `programming`.
-5. Add one file only to `writing`.
-6. Add one shared file to both views under different paths.
-7. Mount both views simultaneously at separate mount points.
-8. Show that each view lists only its mapped files.
-9. Modify the shared file in one view.
-10. Show the modification through the other view.
-11. Rename the shared file in one view.
-12. Show that the other view's path is unchanged.
-13. Unmount and remount.
-14. Show that mappings persist.
+1. Initializes a new backing store.
+2. Creates a view and a directory tree of property filters, including a
+   flowed pair (so a child directory is a strict subset of its parent).
+3. Imports files and assigns properties, including one object that matches
+   several directories at once.
+4. Shows computed membership: the same object appearing in multiple
+   directories with no copies.
+5. Queries objects with `find --prop`.
+6. Mounts the view and browses it with ordinary commands.
+7. Creates a file inside a filtered directory and shows it gained that
+   directory's properties.
+8. Re-filters the same objects through a second view.
+9. Unmounts and remounts, showing everything persists.
 
 ## 19. Build and Platform Requirements
 
-The prototype shall target Linux.
-
-The implementation shall support FUSE 3.
-
-The build instructions shall include Fedora-oriented setup commands.
-
-Expected Fedora dependencies include:
+The prototype targets Linux and FUSE 3. Build instructions shall include
+Fedora-oriented setup. Expected Fedora dependencies:
 
 ```sh
-sudo dnf install fuse3 fuse3-devel gcc make pkgconf-pkg-config
+sudo dnf install fuse3 fuse3-devel libpq libpq-devel \
+                 gcc make pkgconf-pkg-config postgresql
 ```
 
-If the implementation uses another language, the README shall include equivalent dependency installation instructions.
-
-The project shall include a simple build command, such as one of:
-
-```sh
-make
-cargo build
-go build
-python -m build
-```
-
-The selected implementation language is not specified by this document.
+The project shall build with `make`, producing the `viewfs` CLI and the
+`viewfs-fuse` daemon.
 
 ## 20. Documentation Requirements
 
-The project shall include a README explaining:
-
-1. What the prototype demonstrates.
-2. What it does not attempt to solve.
-3. How to build it.
-4. How to initialize a backing store.
-5. How to create views.
-6. How to import files.
-7. How to map files into views.
-8. How to mount and unmount views.
-9. How to use tags and attributes.
-10. How shared objects behave.
-11. What the security limitations are.
-12. How to run tests.
-13. How to run the demonstration script.
-
-The README shall explicitly state that the prototype is experimental and should not be used for irreplaceable data.
+The README shall explain: what the prototype demonstrates and does not; how to
+build it; how to initialize a backing store; how to create views and
+directories; how to attach property filters and assign object properties; how
+files become members by property match (including flow); how to import,
+mount, and unmount; how shared objects behave; how to use properties and
+xattrs; security limitations; and how to run the tests and the demonstration.
+The README shall state that the prototype is experimental and should not be
+used for irreplaceable data, and shall describe the durability contract
+(writes completed by `close(2)` are durable; in-flight writes are not).
 
 ## 21. Acceptance Criteria
 
 The implementation is acceptable when all of the following are true:
 
 1. A user can initialize a backing store.
-2. A user can create at least two views.
-3. A user can import files as objects.
-4. A user can map objects into views at arbitrary paths.
+2. A user can create at least two views, each with a directory tree.
+3. A user can import files as objects and give them properties.
+4. A user can attach property filters to directories, including flowed pairs.
 5. A user can mount a view with FUSE.
-6. The mounted view behaves like a normal directory tree for basic shell commands.
-7. Files outside the active view are not visible through that mount.
-8. The same object can be visible in multiple views.
-9. The same object can have different names or paths in different views.
-10. Content changes through one view are reflected through other views referencing the same object.
-11. Renaming a mapping in one view does not rename the mapping in another view.
-12. Removing a mapping in one view does not delete the object from other views.
-13. View mappings persist after unmount and remount.
-14. Tags and attributes can be assigned and queried.
+6. The mounted view behaves like a normal directory tree for basic shell
+   commands.
+7. Objects whose properties do not match a directory are not visible there.
+8. The same object is visible in every directory and view whose filter it
+   satisfies, with no copies.
+9. Creating a file in a directory gives it that directory's properties;
+   moving a file swaps source pairs for destination pairs.
+10. Content changes through one view are reflected through other views
+    referencing the same object.
+11. Editing one view's directory filters does not change another view's
+    directories.
+12. `unlink` deletes the object; changing properties removes a file from a
+    directory without destroying it.
+13. Views, directories, filters, and properties persist across unmount and
+    remount.
+14. Multi-valued properties can be assigned and queried, including AND
+    across pairs and the flow flag.
 15. Automated tests cover the required behavior.
 16. The README documents build, usage, limitations, and demo steps.
 
 ## 22. Suggested Repository Layout
 
-The implementation may use any suitable layout, but the repository should contain equivalent components:
-
 ```text
 viewfs/
   README.md
-  SPEC.md
-  Makefile or build file
+  Plan-rewrite.md            (authoritative model + plan)
+  viewfs_fuse_prototype_spec.md
+  Makefile
+  include/viewfs/viewfs.h
   src/
-    fuse_daemon.*
-    cli.*
-    metadata_store.*
-    path_resolution.*
-    object_store.*
+    libviewfs/   (store, objects, object_props, view_dirs, members, find, …)
+    cli/         (viewfs: view, dir, object, prop, find, mount, check, …)
+    fuse/        (viewfs-fuse daemon: membership-driven callbacks)
   tests/
-    test_views.*
-    test_mappings.*
-    test_tags_attrs.*
-    test_fuse_mount.*
+    unit/        (canonicalizer, object id, property model)
+    integration/ (end-to-end: dirs/props, mount read/write, dup names, check, crash)
   examples/
     demo.sh
 ```
 
-This layout is only a suggestion for organizing the work. The requirements in this specification are authoritative over the suggested layout.
+The requirements in this specification are authoritative over the suggested
+layout.
 
 ## 23. Important Design Constraints
 
 The implementation shall preserve these core conceptual constraints:
 
-1. Views are first-class named entities.
-2. A view is not merely a directory; it is a separate user-facing hierarchy.
-3. Object identity is independent of any view path.
-4. View paths are mappings from a view hierarchy to objects.
-5. The same object may appear in multiple views.
-6. The same object may appear under different names in different views.
-7. Programs access files normally through paths.
-8. Programs using a mounted view shall see only that view's visible files.
-9. Attributes and tags are associated with objects, not merely paths.
-10. The prototype is layered over an existing filesystem through FUSE.
+1. Views are first-class named entities — separate user-facing hierarchies.
+2. Object identity is independent of view, directory, name, and properties.
+3. A directory is a property **filter**; its file contents are computed.
+4. An object appears in a directory iff its properties are a superset of the
+   directory's effective filter.
+5. The same object may appear in many directories and views at once, by
+   match, with no copies.
+6. Properties (and tags, which are just properties) belong to objects, not
+   paths; they are multi-valued.
+7. A directory filter pair may flow to descendants (cumulative) or not
+   (independent).
+8. Programs access files normally through paths; a mounted view shows only
+   its matching files.
+9. The prototype is layered over an existing filesystem through FUSE, with
+   metadata in PostgreSQL.
 
 ## 24. Handoff Instruction for Claude Code
 
-Implement the project described in this specification as a working Linux FUSE 3 prototype.
-
-Favor a small, understandable, testable implementation over a complex or highly optimized one.
-
-Do not attempt to implement kernel code.
-
-Do not attempt to design a production filesystem.
-
-Do not add major unrelated features.
-
-Where this specification leaves implementation choices open, choose the simplest option that satisfies the acceptance criteria and document the choice in the README.
+Implement the project described in this specification as a working Linux
+FUSE 3 prototype. Favor a small, understandable, testable implementation over
+a complex or highly optimized one. Do not implement kernel code, design a
+production filesystem, or add major unrelated features. Where this
+specification leaves choices open, choose the simplest option that satisfies
+the acceptance criteria and document it in the README.

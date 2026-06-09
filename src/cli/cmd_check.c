@@ -11,9 +11,10 @@
 
 /* Findings accumulator. Each field counts a distinct issue class. */
 struct findings {
-    int64_t orphan_objects;          /* objects with no mappings */
-    int64_t bad_object_refs;         /* mappings.object_id -> missing object */
-    int64_t bad_dir_invariant;       /* mappings violating the CHECK */
+    int64_t orphan_objects;          /* objects with no properties */
+    int64_t broken_dirs;             /* view_dirs whose parent is missing */
+    int64_t bad_dir_structure;       /* view_dirs with inconsistent name/parent */
+    int64_t orphan_prop_rows;        /* object_props -> missing object */
     int64_t content_missing;         /* objects with no content file */
     int64_t content_size_mismatch;   /* objects whose content size != DB size */
     int64_t content_orphan_files;    /* content files with no object row */
@@ -45,15 +46,18 @@ static void inc_orphan(const vfs_object_info *o, void *ud) {
 static int phase1_db(struct findings *f) {
     fprintf(stdout, "[1/3] DB integrity:\n");
     vfs_object_list_orphans(f->store, inc_orphan, f);
-    vfs_check_mappings_bad_objref    (f->store, &f->bad_object_refs);
-    vfs_check_mappings_dir_invariant (f->store, &f->bad_dir_invariant);
+    vfs_check_dirs_reachable(f->store, &f->broken_dirs);
+    vfs_check_dir_structure (f->store, &f->bad_dir_structure);
+    vfs_check_props_orphans (f->store, &f->orphan_prop_rows);
 
-    fprintf(stdout, "  orphan objects (no mappings):       %lld\n",
+    fprintf(stdout, "  objects with no properties:         %lld\n",
             (long long)f->orphan_objects);
-    fprintf(stdout, "  mappings with dangling object_id:   %lld\n",
-            (long long)f->bad_object_refs);
-    fprintf(stdout, "  mappings violating dir-invariant:   %lld\n",
-            (long long)f->bad_dir_invariant);
+    fprintf(stdout, "  directories with a missing parent:  %lld\n",
+            (long long)f->broken_dirs);
+    fprintf(stdout, "  directories with bad name/parent:   %lld\n",
+            (long long)f->bad_dir_structure);
+    fprintf(stdout, "  object_props with no object:        %lld\n",
+            (long long)f->orphan_prop_rows);
     return 0;
 }
 
@@ -340,8 +344,9 @@ int cmd_check(int argc, char **argv) {
     phase4_checksums(&f);
 
     int problems =
-        (f.bad_object_refs > 0) +
-        (f.bad_dir_invariant > 0) +
+        (f.broken_dirs > 0) +
+        (f.bad_dir_structure > 0) +
+        (f.orphan_prop_rows > 0) +
         (f.content_missing > 0) +
         (f.content_size_mismatch > 0) +
         (f.content_orphan_files > f.fixed_orphan_files) +

@@ -1,5 +1,23 @@
 # A guided tour of ViewFS
 
+> **⚠ Reflects the superseded explicit-mapping model.** Many commands in this
+> tour (`view add`, `view remove`, `view populate`, `attr …`, `tag …`,
+> `object paths`, `find --tag/--attr`) no longer exist. The prototype is now
+> **property-driven**; see `README.md` for an up-to-date walkthrough and
+> `Plan-rewrite.md` for the model. Quick translation:
+>
+> | Old | New |
+> |---|---|
+> | `view add V <obj> /p/x` | `dir mkdir V /p` + `dir prop add V /p KEY VAL`, then give the object matching props (`prop set` or `object import --into V:/p`) |
+> | `view remove` / `unlink` to de-list | change the object's properties (`prop unset`), or `mv` it; `rm` now **deletes** the object |
+> | `attr set/get/remove` · `tag add/remove/list` | `prop set` · `prop unset` · `prop list` (a tag is `key='tag'`) |
+> | `find --tag T` · `find --attr K=V` | `find --prop tag=T` · `find --prop K=V` |
+> | `object paths <obj>` | membership is computed; use `dir ls V /dir` or `find --prop` |
+> | `view populate …` | removed — set object properties so they match the directory's filter |
+>
+> The narrative below is kept for the conceptual tour; adapt the commands
+> using the table above.
+
 This document walks you through ViewFS by example. Each section is
 short, has commands you can paste, and shows the output you should
 expect. By the end you'll have created a backing store, mounted a

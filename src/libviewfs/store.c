@@ -28,6 +28,7 @@ static const char MIGRATION_0001[] =
     "CREATE TABLE objects ("
     "  object_id      TEXT PRIMARY KEY,"
     "  kind           TEXT NOT NULL CHECK (kind IN ('file','symlink')),"
+    "  name           TEXT NOT NULL DEFAULT '',"
     "  size           BIGINT NOT NULL DEFAULT 0,"
     "  mode           INTEGER NOT NULL,"
     "  uid            INTEGER,"
@@ -36,50 +37,51 @@ static const char MIGRATION_0001[] =
     "  mtime_ns       BIGINT NOT NULL,"
     "  atime_ns       BIGINT NOT NULL,"
     "  checksum       TEXT,"
+    "  checksum_state BYTEA,"
     "  source_path    TEXT,"
     "  symlink_target TEXT"
     ");"
+    "CREATE TABLE object_props ("
+    "  object_id TEXT NOT NULL REFERENCES objects(object_id) ON DELETE CASCADE,"
+    "  key       TEXT NOT NULL,"
+    "  value     TEXT NOT NULL,"
+    "  ctime_ns  BIGINT NOT NULL,"
+    "  mtime_ns  BIGINT NOT NULL,"
+    "  PRIMARY KEY (object_id, key, value)"
+    ");"
+    "CREATE INDEX object_props_kv  ON object_props (key, value);"
+    "CREATE INDEX object_props_obj ON object_props (object_id);"
     "CREATE TABLE views ("
     "  view_name   TEXT PRIMARY KEY,"
     "  description TEXT,"
     "  ctime_ns    BIGINT NOT NULL,"
     "  mtime_ns    BIGINT NOT NULL"
     ");"
-    "CREATE TABLE mappings ("
-    "  view_name     TEXT NOT NULL REFERENCES views(view_name) ON DELETE CASCADE,"
-    "  view_path     TEXT NOT NULL,"
-    "  parent_path   TEXT NOT NULL,"
-    "  name          TEXT NOT NULL,"
-    "  entry_kind    TEXT NOT NULL CHECK (entry_kind IN ('file','dir','symlink')),"
-    "  object_id     TEXT REFERENCES objects(object_id) ON DELETE SET NULL,"
-    "  mode_override INTEGER,"
-    "  ctime_ns      BIGINT NOT NULL,"
-    "  mtime_ns      BIGINT NOT NULL,"
-    "  PRIMARY KEY (view_name, view_path),"
-    "  CHECK ( (entry_kind = 'dir') = (object_id IS NULL) )"
+    "CREATE TABLE view_dirs ("
+    "  view_name   TEXT NOT NULL REFERENCES views(view_name) ON DELETE CASCADE,"
+    "  dir_path    TEXT NOT NULL,"
+    "  parent_path TEXT NOT NULL,"
+    "  name        TEXT NOT NULL,"
+    "  mode        INTEGER NOT NULL,"
+    "  ctime_ns    BIGINT NOT NULL,"
+    "  mtime_ns    BIGINT NOT NULL,"
+    "  PRIMARY KEY (view_name, dir_path)"
     ");"
-    "CREATE INDEX mappings_parent ON mappings (view_name, parent_path);"
-    "CREATE INDEX mappings_object ON mappings (object_id);"
-    "CREATE TABLE attributes ("
-    "  object_id TEXT NOT NULL REFERENCES objects(object_id) ON DELETE CASCADE,"
+    "CREATE INDEX view_dirs_parent ON view_dirs (view_name, parent_path);"
+    "CREATE TABLE view_dir_props ("
+    "  view_name TEXT NOT NULL,"
+    "  dir_path  TEXT NOT NULL,"
     "  key       TEXT NOT NULL,"
     "  value     TEXT NOT NULL,"
+    "  flow      BOOLEAN NOT NULL DEFAULT FALSE,"
     "  ctime_ns  BIGINT NOT NULL,"
     "  mtime_ns  BIGINT NOT NULL,"
-    "  PRIMARY KEY (object_id, key)"
+    "  PRIMARY KEY (view_name, dir_path, key, value),"
+    "  FOREIGN KEY (view_name, dir_path)"
+    "    REFERENCES view_dirs(view_name, dir_path)"
+    "    ON DELETE CASCADE ON UPDATE CASCADE"
     ");"
-    "CREATE INDEX attributes_kv ON attributes (key, value);"
-    "CREATE TABLE tags ("
-    "  object_id TEXT NOT NULL REFERENCES objects(object_id) ON DELETE CASCADE,"
-    "  tag       TEXT NOT NULL,"
-    "  ctime_ns  BIGINT NOT NULL,"
-    "  PRIMARY KEY (object_id, tag)"
-    ");"
-    "CREATE INDEX tags_tag ON tags (tag);";
-
-/* Keep in sync with src/libviewfs/migrations/0002_checksum_state.sql. */
-static const char MIGRATION_0002[] =
-    "ALTER TABLE objects ADD COLUMN checksum_state BYTEA;";
+    "CREATE INDEX view_dir_props_flow ON view_dir_props (view_name, flow);";
 
 /* ------------------------------------------------------------------
  * Common helpers
@@ -201,17 +203,6 @@ vfs_error vfs_apply_migrations(vfs_store *s) {
         rc = vfs_exec_simple(s, "COMMIT");
         if (rc != VFS_OK) return rc;
     }
-    if (applied_v < 2) {
-        vfs_error rc = vfs_exec_simple(s, "BEGIN");
-        if (rc != VFS_OK) return rc;
-        rc = vfs_exec_simple(s, MIGRATION_0002);
-        if (rc != VFS_OK) { vfs_exec_simple(s, "ROLLBACK"); return rc; }
-        rc = vfs_exec_simple(s,
-            "INSERT INTO schema_migrations (version) VALUES (2)");
-        if (rc != VFS_OK) { vfs_exec_simple(s, "ROLLBACK"); return rc; }
-        rc = vfs_exec_simple(s, "COMMIT");
-        if (rc != VFS_OK) return rc;
-    }
     return VFS_OK;
 }
 
@@ -219,17 +210,111 @@ vfs_error vfs_apply_migrations(vfs_store *s) {
  * Store lifecycle
  * ------------------------------------------------------------------ */
 
-static vfs_error connect_pq(vfs_store *s) {
-    const char *ci = s->conninfo[0] ? s->conninfo : NULL;
-    PGconn *pg = PQconnectdb(ci ? ci : "");
-    if (PQstatus(pg) != CONNECTION_OK) {
-        vfs_seterr(s, "PostgreSQL connect failed: %s", PQerrorMessage(pg));
-        PQfinish(pg);
+/* Open a connection to a maintenance database (`maint_db`) using every
+ * field of `opts` except dbname, which is overridden. Returns NULL on
+ * allocation failure; the caller checks PQstatus on a non-NULL result. */
+static PGconn *connect_maintenance(PQconninfoOption *opts, const char *maint_db) {
+    int n = 0;
+    for (PQconninfoOption *o = opts; o->keyword; o++) n++;
+    const char **kw  = calloc((size_t)n + 2, sizeof *kw);
+    const char **val = calloc((size_t)n + 2, sizeof *val);
+    if (!kw || !val) { free(kw); free(val); return NULL; }
+    int i = 0, have_db = 0;
+    for (PQconninfoOption *o = opts; o->keyword; o++) {
+        if (!o->val || !*o->val) continue;
+        kw[i] = o->keyword;
+        if (!strcmp(o->keyword, "dbname")) { val[i] = maint_db; have_db = 1; }
+        else                               { val[i] = o->val; }
+        i++;
+    }
+    if (!have_db) { kw[i] = "dbname"; val[i] = maint_db; i++; }
+    kw[i] = NULL; val[i] = NULL;
+    PGconn *m = PQconnectdbParams(kw, val, 0);
+    free(kw); free(val);
+    return m;
+}
+
+/* Create the database named in s->conninfo (used by `init` when the target
+ * database does not yet exist). Connects to a maintenance database with the
+ * same host/user/etc. and issues CREATE DATABASE. */
+static vfs_error try_create_database(vfs_store *s) {
+    char *errmsg = NULL;
+    PQconninfoOption *opts = PQconninfoParse(s->conninfo[0] ? s->conninfo : "",
+                                            &errmsg);
+    if (!opts) {
+        vfs_seterr(s, "cannot parse conninfo: %s", errmsg ? errmsg : "(unknown)");
+        if (errmsg) PQfreemem(errmsg);
         return VFS_ERR_DB;
     }
-    s->pg = pg;
-    return VFS_OK;
+    const char *dbname = NULL;
+    for (PQconninfoOption *o = opts; o->keyword; o++)
+        if (!strcmp(o->keyword, "dbname") && o->val && *o->val) dbname = o->val;
+    if (!dbname) {
+        vfs_seterr(s, "conninfo specifies no dbname; cannot create database");
+        PQconninfoFree(opts);
+        return VFS_ERR_DB;
+    }
+
+    const char *maint[] = { "postgres", "template1" };
+    vfs_error rc = VFS_ERR_DB;
+    for (size_t k = 0; k < sizeof maint / sizeof maint[0]; k++) {
+        PGconn *m = connect_maintenance(opts, maint[k]);
+        if (!m) continue;
+        if (PQstatus(m) != CONNECTION_OK) { PQfinish(m); continue; }
+        char *qid = PQescapeIdentifier(m, dbname, strlen(dbname));
+        if (!qid) { PQfinish(m); continue; }
+        char sql[512];
+        snprintf(sql, sizeof sql, "CREATE DATABASE %s", qid);
+        PQfreemem(qid);
+        PGresult *r = PQexec(m, sql);
+        const char *code = PQresultErrorField(r, PG_DIAG_SQLSTATE);
+        if (PQresultStatus(r) == PGRES_COMMAND_OK ||
+            (code && !strcmp(code, "42P04"))) {   /* 42P04 = duplicate_database */
+            rc = VFS_OK;
+        } else {
+            vfs_seterr(s, "CREATE DATABASE failed: %s", PQresultErrorMessage(r));
+        }
+        PQclear(r);
+        PQfinish(m);
+        if (rc == VFS_OK) break;
+    }
+    PQconninfoFree(opts);
+    return rc;
 }
+
+/* Connect to s->conninfo. When create_db is set and the initial connect
+ * fails (e.g. the database does not exist), attempt to CREATE DATABASE via a
+ * maintenance connection and retry once. */
+static vfs_error connect_pq_ex(vfs_store *s, int create_db) {
+    const char *ci = s->conninfo[0] ? s->conninfo : NULL;
+    PGconn *pg = PQconnectdb(ci ? ci : "");
+    if (PQstatus(pg) == CONNECTION_OK) { s->pg = pg; return VFS_OK; }
+
+    if (create_db) {
+        char first_err[512];
+        snprintf(first_err, sizeof first_err, "%s", PQerrorMessage(pg));
+        PQfinish(pg);
+        if (try_create_database(s) == VFS_OK) {
+            pg = PQconnectdb(ci ? ci : "");
+            if (PQstatus(pg) == CONNECTION_OK) { s->pg = pg; return VFS_OK; }
+            vfs_seterr(s, "connect after CREATE DATABASE failed: %s",
+                       PQerrorMessage(pg));
+            PQfinish(pg);
+            return VFS_ERR_DB;
+        }
+        /* try_create_database set a message; prefer the original connect
+         * error if it is more informative. */
+        if (s->last_error[0] == '\0')
+            vfs_seterr(s, "PostgreSQL connect failed: %s", first_err);
+        return VFS_ERR_DB;
+    }
+
+    vfs_seterr(s, "PostgreSQL connect failed: %s", PQerrorMessage(pg));
+    PQfinish(pg);
+    return VFS_ERR_DB;
+}
+
+static vfs_error connect_pq(vfs_store *s) { return connect_pq_ex(s, 0); }
 
 static vfs_error set_search_path(vfs_store *s) {
     char sql[256];
@@ -269,7 +354,9 @@ vfs_error vfs_store_create(const char *store_path,
     vfs_error rc = vfs_store_mkskel(store_path);
     if (rc != VFS_OK) return rc;
 
-    rc = connect_pq(&local);
+    /* `init` creates the database too: if the target db does not exist,
+     * connect_pq_ex connects to a maintenance db and CREATE DATABASEs it. */
+    rc = connect_pq_ex(&local, 1);
     if (rc != VFS_OK) {
         /* propagate error message via stderr by storing in a static buf */
         fprintf(stderr, "viewfs: %s\n", local.last_error);
@@ -377,22 +464,45 @@ static vfs_error count_query(vfs_store *s, const char *sql, int64_t *out) {
     return VFS_OK;
 }
 
-vfs_error vfs_check_mappings_bad_objref(vfs_store *s, int64_t *out) {
+vfs_error vfs_check_dirs_reachable(vfs_store *s, int64_t *out) {
     if (!s || !out) return VFS_ERR_BADARGS;
+    /* Count directory rows whose parent_path names a directory that does
+     * not exist in the same view (a broken tree). Root rows have
+     * parent_path='' and are excluded. In a healthy store this is 0. */
     return count_query(s,
-        "SELECT count(*) FROM mappings m "
-        "WHERE m.object_id IS NOT NULL "
-        "  AND NOT EXISTS (SELECT 1 FROM objects o "
-        "                  WHERE o.object_id = m.object_id)",
+        "SELECT count(*) FROM view_dirs d "
+        "WHERE d.parent_path <> '' "
+        "  AND NOT EXISTS (SELECT 1 FROM view_dirs p "
+        "                  WHERE p.view_name = d.view_name "
+        "                    AND p.dir_path  = d.parent_path)",
         out);
 }
 
-vfs_error vfs_check_mappings_dir_invariant(vfs_store *s, int64_t *out) {
+vfs_error vfs_check_dir_structure(vfs_store *s, int64_t *out) {
     if (!s || !out) return VFS_ERR_BADARGS;
-    /* Both halves of the CHECK constraint -- belt and braces. */
+    /* A directory row is structurally consistent when its name is the final
+     * path component and its parent_path is the dirname (or '/' for a
+     * top-level dir; '' only for the root). Counts violators. */
     return count_query(s,
-        "SELECT count(*) FROM mappings "
-        "WHERE (entry_kind = 'dir')  <> (object_id IS NULL)",
+        "SELECT count(*) FROM view_dirs WHERE NOT ("
+        "  (dir_path = '/' AND parent_path = '' AND name = '') OR "
+        "  (dir_path <> '/' "
+        "   AND name = substring(dir_path from '[^/]+$') "
+        "   AND ( (position('/' in substring(dir_path from 2)) = 0 "
+        "          AND parent_path = '/') "
+        "         OR parent_path = substring(dir_path from 1 "
+        "                          for length(dir_path) - length(name) - 1) )))",
+        out);
+}
+
+vfs_error vfs_check_props_orphans(vfs_store *s, int64_t *out) {
+    if (!s || !out) return VFS_ERR_BADARGS;
+    /* object_props rows referencing a missing object. The FK makes this
+     * impossible barring DB tampering, but the scan is cheap. */
+    return count_query(s,
+        "SELECT count(*) FROM object_props p "
+        "WHERE NOT EXISTS (SELECT 1 FROM objects o "
+        "                  WHERE o.object_id = p.object_id)",
         out);
 }
 
@@ -401,7 +511,7 @@ vfs_error vfs_count_rows(vfs_store *s, const char *table_id, int64_t *out) {
     /* table_id is an enum-like constant; whitelist to avoid SQL injection
      * via the FROM clause. */
     static const char *const allowed[] = {
-        "objects", "views", "mappings", "attributes", "tags", NULL,
+        "objects", "object_props", "views", "view_dirs", "view_dir_props", NULL,
     };
     int ok = 0;
     for (size_t i = 0; allowed[i]; i++) {

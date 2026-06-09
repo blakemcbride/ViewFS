@@ -79,9 +79,9 @@ cd viewfs
 
 ## 3. Set up PostgreSQL
 
-ViewFS keeps every piece of metadata (views, mappings, objects, tags,
-attributes) in PostgreSQL. Content blobs are kept as ordinary files on
-the host filesystem.
+ViewFS keeps every piece of metadata (views, directories and their property
+filters, objects and their properties) in PostgreSQL. Content blobs are kept
+as ordinary files on the host filesystem.
 
 ### Start the server (Fedora)
 
@@ -92,23 +92,27 @@ sudo postgresql-setup --initdb     # first time only
 sudo systemctl enable --now postgresql
 ```
 
-### Create a database
+### Database
 
-You can connect as the system `postgres` superuser, or as a dedicated
-user — both work. The simplest "dev box" setup uses the `postgres`
-role over the local Unix socket:
+You do **not** need to create the database by hand: `viewfs init` creates it
+automatically if it is missing (it connects to the `postgres` maintenance
+database and runs `CREATE DATABASE`), provided the connecting role has the
+`CREATEDB` privilege. You only need a role ViewFS can connect as.
+
+You can connect as the system `postgres` superuser, or as a dedicated user —
+both work. The simplest "dev box" setup uses the `postgres` role over the
+local Unix socket and needs no further setup; `viewfs init` will create the
+`viewfs` database on first run.
+
+To connect as your own login user instead (so you don't need `sudo -u` for
+every operation), create the role with `CREATEDB` (or superuser):
 
 ```sh
-sudo -u postgres createdb viewfs
+sudo -u postgres createuser -s "$USER"      # -s superuser; or --createdb
 ```
 
-To connect as your own login user instead (so you don't need `sudo -u`
-for every operation):
-
-```sh
-sudo -u postgres createuser -s "$USER"
-sudo -u postgres createdb -O "$USER" viewfs
-```
+If you prefer to pre-create the database explicitly, that still works
+(`sudo -u postgres createdb viewfs`), and `init` will simply use it.
 
 ### Verify the connection works
 

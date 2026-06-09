@@ -45,13 +45,14 @@ int cmd_status(int argc, char **argv) {
     if (!s) return rc;
 
     int     sv = -1;
-    int64_t nviews = 0, nobjs = 0, nmaps = 0, norph = 0;
+    int64_t nviews = 0, nobjs = 0, ndirs = 0, nprops = 0, norph = 0;
     int64_t content_bytes = 0, content_files = 0;
 
     vfs_schema_version(s, &sv);
-    vfs_count_rows(s, "views",    &nviews);
-    vfs_count_rows(s, "objects",  &nobjs);
-    vfs_count_rows(s, "mappings", &nmaps);
+    vfs_count_rows(s, "views",         &nviews);
+    vfs_count_rows(s, "objects",       &nobjs);
+    vfs_count_rows(s, "view_dirs",     &ndirs);
+    vfs_count_rows(s, "object_props",  &nprops);
     vfs_object_list_orphans(s, orphan_count_cb, &norph);
 
     char obj_dir[VFS_PATH_MAX];
@@ -67,9 +68,10 @@ int cmd_status(int argc, char **argv) {
            sv, VIEWFS_SCHEMA_VERSION);
     printf("  conninfo:         %s\n",          vfs_store_conninfo(s));
     printf("  views:            %lld\n",        (long long)nviews);
-    printf("  objects:          %lld (orphans: %lld)\n",
+    printf("  objects:          %lld (propertyless: %lld)\n",
            (long long)nobjs, (long long)norph);
-    printf("  mappings:         %lld\n",        (long long)nmaps);
+    printf("  directories:      %lld\n",        (long long)ndirs);
+    printf("  object_props:     %lld\n",        (long long)nprops);
     printf("  content storage:  %lld file(s), %s (%lld bytes)\n",
            (long long)content_files, size_human, (long long)content_bytes);
 

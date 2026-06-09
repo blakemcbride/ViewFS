@@ -58,4 +58,15 @@ vfs_error vfs_apply_migrations(vfs_store *s);
  * failure. Returns VFS_OK on PGRES_COMMAND_OK or PGRES_TUPLES_OK. */
 vfs_error vfs_exec_simple(vfs_store *s, const char *sql);
 
+/* internal: fetch the DISTINCT effective (key,value) property set of a
+ * directory (own pairs + flowed ancestor pairs) as a two-column PGresult.
+ * Returns NULL on error (last_error set). Caller PQclear()s the result.
+ * dir_path must be canonical ("/" for root). Used by members + find. */
+PGresult *vfs_dir_effective_result(vfs_store *s, const char *view,
+                                   const char *dir_path);
+
+/* internal: count the objects matching a directory's effective set. */
+vfs_error vfs_dir_member_count(vfs_store *s, const char *view,
+                               const char *dir_path, int64_t *out);
+
 #endif

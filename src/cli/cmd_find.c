@@ -1,51 +1,66 @@
+/* `viewfs find --prop KEY[=VALUE] ...` -- objects matching ALL pairs (AND).
+ * A bare KEY matches any value of that key. */
+
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "common.h"
 
+#define MAX_PAIRS 32
+
 static int usage(void) {
     fprintf(stderr,
-"Usage: viewfs find --tag TAG\n"
-"       viewfs find --attr KEY=VALUE\n"
-"       viewfs find --attr KEY\n");
+"Usage: viewfs find --prop KEY[=VALUE] [--prop KEY[=VALUE]]...\n"
+"  Lists objects whose properties satisfy every --prop pair.\n"
+"  A bare KEY (no =VALUE) matches any value of that key.\n");
     return 2;
 }
 
 static void print_object(const vfs_object_info *o, void *ud) {
     (void)ud;
-    printf("%s  %-7s  %10lld  %s\n",
-           o->id.hex, o->kind, (long long)o->size,
-           o->source_path ? o->source_path : "");
+    printf("%s  %-7s  %-24s %10lld\n",
+           o->id.hex, o->kind, o->name[0] ? o->name : "-", (long long)o->size);
 }
 
 int cmd_find(int argc, char **argv) {
-    const char *tag  = cli_take_flag(&argc, argv, "--tag", 0);
-    const char *attr = cli_take_flag(&argc, argv, "--attr", 0);
-    if (!tag && !attr) return usage();
-    if (tag && attr) {
-        fprintf(stderr, "viewfs: --tag and --attr are mutually exclusive\n");
-        return 2;
+    /* Collect every --prop occurrence. */
+    char *specs[MAX_PAIRS];
+    int nspecs = 0;
+    for (;;) {
+        const char *p = cli_take_flag(&argc, argv, "--prop", 0);
+        if (!p) break;
+        if (nspecs >= MAX_PAIRS) {
+            fprintf(stderr, "viewfs: too many --prop flags (max %d)\n", MAX_PAIRS);
+            return 2;
+        }
+        specs[nspecs] = strdup(p);
+        if (!specs[nspecs]) { fprintf(stderr, "viewfs: out of memory\n"); return 2; }
+        nspecs++;
     }
+    if (nspecs == 0) { for (int i = 0; i < nspecs; i++) free(specs[i]); return usage(); }
+
     int rc_open = 0;
     vfs_store *s = cli_open_store(&argc, argv, &rc_open);
-    if (!s) return rc_open;
+    if (!s) { for (int i = 0; i < nspecs; i++) free(specs[i]); return rc_open; }
 
-    vfs_error e;
-    if (tag) {
-        e = vfs_find_by_tag(s, tag, print_object, NULL);
-    } else {
-        char key[256];
-        const char *eq = strchr(attr, '=');
-        if (!eq) {
-            e = vfs_find_by_attr(s, attr, NULL, print_object, NULL);
-        } else {
-            size_t kl = (size_t)(eq - attr);
-            if (kl >= sizeof key) { vfs_store_close(s); return usage(); }
-            memcpy(key, attr, kl); key[kl] = '\0';
-            e = vfs_find_by_attr(s, key, eq + 1, print_object, NULL);
-        }
+    if (argc != 2) {
+        for (int i = 0; i < nspecs; i++) free(specs[i]);
+        vfs_store_close(s);
+        return usage();
     }
+
+    vfs_prop_pair pairs[MAX_PAIRS];
+    for (int i = 0; i < nspecs; i++) {
+        char *eq = strchr(specs[i], '=');
+        if (eq) { *eq = '\0'; pairs[i].key = specs[i]; pairs[i].value = eq + 1; }
+        else    { pairs[i].key = specs[i]; pairs[i].value = NULL; }
+    }
+
+    vfs_error e = vfs_find_by_props(s, pairs, nspecs, print_object, NULL);
     int rc = (e == VFS_OK) ? 0 : cli_perror(s, e, "find");
+
+    for (int i = 0; i < nspecs; i++) free(specs[i]);
     vfs_store_close(s);
     return rc;
 }

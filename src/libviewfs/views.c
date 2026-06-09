@@ -27,7 +27,8 @@ vfs_error vfs_view_create(vfs_store *s, const char *name, const char *descriptio
         return VFS_ERR_DB;
     }
     PQclear(r);
-    return VFS_OK;
+    /* Every view has an always-present root directory ("/"). */
+    return vfs_dir_ensure_root(s, name);
 }
 
 vfs_error vfs_view_delete(vfs_store *s, const char *name) {
