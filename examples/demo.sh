@@ -35,8 +35,8 @@ DEMO_SCHEMA="${VIEWFS_DEMO_SCHEMA:-viewfs_demo}"
 
 SELF_DIR=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$SELF_DIR/.." && pwd)
-VFS="$ROOT/viewfs"
-VFS_FUSE="$ROOT/viewfs-fuse"
+VFS="$ROOT/vfs"
+VFS_FUSE="$ROOT/vfs-fuse"
 
 for bin in "$VFS" "$VFS_FUSE"; do
   [[ -x "$bin" ]] || { echo "demo.sh: $bin not found — run 'make' first." >&2; exit 2; }

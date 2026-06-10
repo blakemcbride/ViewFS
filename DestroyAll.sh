@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # DestroyAll.sh -- erase the ViewFS object store + Postgres database. It tears the
-# system down only; it does NOT create anything. Run `viewfs init` yourself
+# system down only; it does NOT create anything. Run `vfs init` yourself
 # to start fresh (init recreates the database and schema for you).
 #
 # It (1) unmounts any live ViewFS FUSE mounts and stops their daemons,
@@ -110,5 +110,5 @@ echo "removed object store $STORE"
 
 echo
 echo "Old ViewFS system erased. Nothing was recreated."
-echo "Run 'viewfs init' when you want a fresh store; it will recreate the"
+echo "Run 'vfs init' when you want a fresh store; it will recreate the"
 echo "database and schema."

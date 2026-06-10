@@ -36,7 +36,7 @@ vfs_store *cli_open_store(int *argc, char **argv, int *exit_rc) {
     if (!store_path) store_path = getenv("VIEWFS_STORE");
     if (!store_path || !*store_path) {
         fprintf(stderr,
-            "viewfs: store path required (pass --store PATH or set VIEWFS_STORE)\n");
+            "vfs: store path required (pass --store PATH or set VIEWFS_STORE)\n");
         *exit_rc = 2;
         return NULL;
     }
@@ -54,11 +54,11 @@ int cli_resolve_object(vfs_store *s, const char *arg, vfs_object_id *id) {
     vfs_error rc = vfs_object_resolve(s, arg, id);
     if (rc == VFS_OK) return 0;
     if (rc == VFS_ERR_NOTFOUND)
-        fprintf(stderr, "viewfs: no object matching '%s'\n", arg);
+        fprintf(stderr, "vfs: no object matching '%s'\n", arg);
     else if (rc == VFS_ERR_AMBIGUOUS)
-        fprintf(stderr, "viewfs: object prefix '%s' is ambiguous\n", arg);
+        fprintf(stderr, "vfs: object prefix '%s' is ambiguous\n", arg);
     else
-        fprintf(stderr, "viewfs: %s (%s)\n",
+        fprintf(stderr, "vfs: %s (%s)\n",
                 vfs_error_str(rc), vfs_store_last_error(s));
     return 1;
 }
@@ -187,7 +187,7 @@ int cli_resolve_dir(int n, const char *a0, const char *a1,
     vfs_canon_path cp;
     if (n == 2) {
         if (vfs_path_canonicalize(a1, &cp) != VFS_OK) {
-            fprintf(stderr, "viewfs: invalid directory path '%s'\n", a1);
+            fprintf(stderr, "vfs: invalid directory path '%s'\n", a1);
             return -1;
         }
         snprintf(view_out, vsz, "%s", a0);
@@ -198,7 +198,7 @@ int cli_resolve_dir(int n, const char *a0, const char *a1,
     char cwd_view[128], cwd_dir[VFS_PATH_MAX];
     if (cli_view_dir_from_cwd(cwd_view, sizeof cwd_view,
                               cwd_dir, sizeof cwd_dir) != 0) {
-        fprintf(stderr, "viewfs: not inside a mounted ViewFS view; "
+        fprintf(stderr, "vfs: not inside a mounted ViewFS view; "
                         "give VIEW and DIR explicitly\n");
         return -1;
     }
@@ -217,11 +217,11 @@ int cli_resolve_dir(int n, const char *a0, const char *a1,
               ? -1 : (memcpy(joined, a0, strlen(a0) + 1), 0))
         : join_path(joined, sizeof joined, cwd_dir, a0);
     if (too_long != 0) {
-        fprintf(stderr, "viewfs: directory path too long\n");
+        fprintf(stderr, "vfs: directory path too long\n");
         return -1;
     }
     if (vfs_path_canonicalize(joined, &cp) != VFS_OK) {
-        fprintf(stderr, "viewfs: invalid directory path '%s'\n", a0);
+        fprintf(stderr, "vfs: invalid directory path '%s'\n", a0);
         return -1;
     }
     snprintf(dir_out, dsz, "%s", cp.path);
@@ -237,9 +237,9 @@ int cli_perror(vfs_store *s, vfs_error e, const char *context) {
     const char *msg = vfs_error_str(e);
     const char *detail = s ? vfs_store_last_error(s) : NULL;
     if (context) {
-        fprintf(stderr, "viewfs: %s: %s", context, msg);
+        fprintf(stderr, "vfs: %s: %s", context, msg);
     } else {
-        fprintf(stderr, "viewfs: %s", msg);
+        fprintf(stderr, "vfs: %s", msg);
     }
     if (detail && strcmp(detail, "(no error)") != 0 && *detail) {
         fprintf(stderr, " (%s)", detail);

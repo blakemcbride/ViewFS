@@ -13,7 +13,7 @@ vfs_store *cli_open_store(int *argc, char **argv, int *exit_rc);
  * `boolean=1` treats the flag as a switch and writes "1" / NULL. */
 const char *cli_take_flag(int *argc, char **argv, const char *flag, int boolean);
 
-/* Print a libviewfs error to stderr in the form "viewfs: <msg>" and return
+/* Print a libviewfs error to stderr in the form "vfs: <msg>" and return
  * the exit code 1. If `last` is non-NULL, prepends a context line. */
 int cli_perror(vfs_store *s, vfs_error e, const char *context);
 

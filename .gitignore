@@ -1,7 +1,7 @@
 # Build output
 build/
-viewfs
-viewfs-fuse
+vfs
+vfs-fuse
 
 # Common C build leftovers (in case anyone builds outside build/)
 *.o

@@ -1,4 +1,4 @@
-/* `viewfs find --prop KEY[=VALUE] ...` -- objects matching ALL pairs (AND).
+/* `vfs find --prop KEY[=VALUE] ...` -- objects matching ALL pairs (AND).
  * A bare KEY matches any value of that key. */
 
 #include <stdio.h>
@@ -11,7 +11,7 @@
 
 static int usage(void) {
     fprintf(stderr,
-"Usage: viewfs find --prop KEY[=VALUE] [--prop KEY[=VALUE]]...\n"
+"Usage: vfs find --prop KEY[=VALUE] [--prop KEY[=VALUE]]...\n"
 "  Lists objects whose properties satisfy every --prop pair.\n"
 "  A bare KEY (no =VALUE) matches any value of that key.\n");
     return 2;
@@ -31,11 +31,11 @@ int cmd_find(int argc, char **argv) {
         const char *p = cli_take_flag(&argc, argv, "--prop", 0);
         if (!p) break;
         if (nspecs >= MAX_PAIRS) {
-            fprintf(stderr, "viewfs: too many --prop flags (max %d)\n", MAX_PAIRS);
+            fprintf(stderr, "vfs: too many --prop flags (max %d)\n", MAX_PAIRS);
             return 2;
         }
         specs[nspecs] = strdup(p);
-        if (!specs[nspecs]) { fprintf(stderr, "viewfs: out of memory\n"); return 2; }
+        if (!specs[nspecs]) { fprintf(stderr, "vfs: out of memory\n"); return 2; }
         nspecs++;
     }
     if (nspecs == 0) { for (int i = 0; i < nspecs; i++) free(specs[i]); return usage(); }

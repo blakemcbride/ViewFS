@@ -1,7 +1,7 @@
-/* `viewfs dir` -- manage the per-view directory tree (mkdir / rmdir / ls).
+/* `vfs dir` -- manage the per-view directory tree (mkdir / rmdir / ls).
  * A directory's contents are computed (objects whose properties are a
  * superset of the directory's effective filter). Directory *filters* are
- * managed with `viewfs prop` (a directory is just another `prop` target).
+ * managed with `vfs prop` (a directory is just another `prop` target).
  *
  * Inside a mounted view, VIEW/DIR may be omitted and are taken from the
  * current directory; a lone DIR is resolved relative to the cwd (see
@@ -15,15 +15,15 @@
 
 static void print_usage(FILE *out) {
     fprintf(out,
-"Usage: viewfs dir <subcommand> [args]\n"
+"Usage: vfs dir <subcommand> [args]\n"
 "  Inside a mounted view, VIEW/DIR may be omitted (taken from your cwd);\n"
 "  a lone DIR is resolved relative to the current directory.\n"
 "  dir mkdir [VIEW] DIR\n"
 "  dir rmdir [VIEW] DIR\n"
 "  dir ls [[VIEW] DIR]              computed contents (dirs + files)\n"
 "\n"
-"  Directory property filters are managed with `viewfs prop` — e.g.\n"
-"  `viewfs prop set VIEW:DIR KEY VALUE [--flow]`, `viewfs prop list VIEW:DIR`.\n");
+"  Directory property filters are managed with `vfs prop` — e.g.\n"
+"  `vfs prop set VIEW:DIR KEY VALUE [--flow]`, `vfs prop list VIEW:DIR`.\n");
 }
 static int usage(void) { print_usage(stderr); return 2; }
 
@@ -40,15 +40,15 @@ static void print_member(const vfs_object_info *o, void *ud) {
 static int err_dir(vfs_store *s, vfs_error e, const char *view,
                    const char *dir, const char *ctx) {
     if (e == VFS_ERR_NOTFOUND) {
-        fprintf(stderr, "viewfs: no directory %s:%s\n", view, dir);
+        fprintf(stderr, "vfs: no directory %s:%s\n", view, dir);
         return 1;
     }
     if (e == VFS_ERR_EXISTS) {
-        fprintf(stderr, "viewfs: %s:%s already exists\n", view, dir);
+        fprintf(stderr, "vfs: %s:%s already exists\n", view, dir);
         return 1;
     }
     if (e == VFS_ERR_NOTEMPTY) {
-        fprintf(stderr, "viewfs: %s:%s is not empty\n", view, dir);
+        fprintf(stderr, "vfs: %s:%s is not empty\n", view, dir);
         return 1;
     }
     return cli_perror(s, e, ctx);

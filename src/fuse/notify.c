@@ -20,7 +20,7 @@ static PGconn *open_listen_conn(viewfs_ctx *ctx) {
     const char *ci = ctx->pool->conninfo[0] ? ctx->pool->conninfo : NULL;
     PGconn *pg = PQconnectdb(ci ? ci : "");
     if (PQstatus(pg) != CONNECTION_OK) {
-        fprintf(stderr, "viewfs-fuse: notify PQconnectdb failed: %s",
+        fprintf(stderr, "vfs-fuse: notify PQconnectdb failed: %s",
                 PQerrorMessage(pg));
         PQfinish(pg);
         return NULL;
@@ -29,14 +29,14 @@ static PGconn *open_listen_conn(viewfs_ctx *ctx) {
     snprintf(sql, sizeof sql, "SET search_path TO \"%s\"", ctx->pool->schema);
     PGresult *r = PQexec(pg, sql);
     if (PQresultStatus(r) != PGRES_COMMAND_OK) {
-        fprintf(stderr, "viewfs-fuse: notify SET search_path: %s",
+        fprintf(stderr, "vfs-fuse: notify SET search_path: %s",
                 PQresultErrorMessage(r));
         PQclear(r); PQfinish(pg); return NULL;
     }
     PQclear(r);
     r = PQexec(pg, "LISTEN viewfs_change");
     if (PQresultStatus(r) != PGRES_COMMAND_OK) {
-        fprintf(stderr, "viewfs-fuse: LISTEN failed: %s",
+        fprintf(stderr, "vfs-fuse: LISTEN failed: %s",
                 PQresultErrorMessage(r));
         PQclear(r); PQfinish(pg); return NULL;
     }
@@ -57,7 +57,7 @@ static void handle_payload(viewfs_ctx *ctx, char *payload) {
     const char *to_invalidate = parent[0] ? parent : "/";
     int rc = fuse_invalidate_path(ctx->fuse_handle, to_invalidate);
     if (ctx->verbose) {
-        fprintf(stderr, "viewfs-fuse[%s]: invalidate %s -> %d\n",
+        fprintf(stderr, "vfs-fuse[%s]: invalidate %s -> %d\n",
                 ctx->view_name, to_invalidate, rc);
     }
 }
@@ -76,7 +76,7 @@ static void *notify_loop(void *arg) {
         if (sret < 0 && errno != EINTR) break;
 
         if (!PQconsumeInput(NCONN)) {
-            fprintf(stderr, "viewfs-fuse: notify PQconsumeInput: %s",
+            fprintf(stderr, "vfs-fuse: notify PQconsumeInput: %s",
                     PQerrorMessage(NCONN));
             break;
         }

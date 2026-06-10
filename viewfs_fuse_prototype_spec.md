@@ -201,7 +201,7 @@ changes to existing application source code.
 The user shall be able to mount a named view at a mount point:
 
 ```sh
-viewfs mount programming ~/mnt/programming
+vfs mount programming ~/mnt/programming
 ```
 
 After mounting, ordinary shell commands shall work (`cd`, `ls`, `cat`,
@@ -311,11 +311,11 @@ filter on a directory; the *target* distinguishes them (an object id, a
 Example command shapes:
 
 ```sh
-viewfs prop set    TARGET language C      # TARGET = object id, VIEW:DIR, or path
-viewfs prop list   TARGET
-viewfs prop unset  TARGET language
-viewfs find --prop language=C
-viewfs find --prop tag=draft --prop author=blake   # AND across pairs
+vfs prop set    TARGET language C      # TARGET = object id, VIEW:DIR, or path
+vfs prop list   TARGET
+vfs prop unset  TARGET language
+vfs find --prop language=C
+vfs find --prop tag=draft --prop author=blake   # AND across pairs
 ```
 
 ### 7.11 Membership Management
@@ -324,12 +324,12 @@ Membership is changed by editing directory filters or object properties — not
 by adding/removing placement rows. The administration tool shall provide:
 
 ```sh
-viewfs dir mkdir   VIEW DIR
-viewfs dir rmdir   VIEW DIR
-viewfs dir ls      VIEW DIR             # computed contents
-viewfs prop set    VIEW:DIR KEY VALUE [--flow]   # attach a filter pair
-viewfs prop unset  VIEW:DIR KEY [VALUE]
-viewfs prop list   VIEW:DIR [--effective]
+vfs dir mkdir   VIEW DIR
+vfs dir rmdir   VIEW DIR
+vfs dir ls      VIEW DIR             # computed contents
+vfs prop set    VIEW:DIR KEY VALUE [--flow]   # attach a filter pair
+vfs prop unset  VIEW:DIR KEY [VALUE]
+vfs prop list   VIEW:DIR [--effective]
 ```
 
 To make an object appear in `VIEW:DIR`, give it that directory's pairs — by
@@ -341,16 +341,16 @@ assigns the directory's effective pairs to the imported object.
 The administration tool shall support:
 
 ```sh
-viewfs view list
-viewfs view create VIEW [DESCRIPTION]
-viewfs view delete VIEW
-viewfs view show   VIEW           # the directory tree
-viewfs object show OBJECT_ID
-viewfs object name OBJECT_ID [NEWNAME]
+vfs view list
+vfs view create VIEW [DESCRIPTION]
+vfs view delete VIEW
+vfs view show   VIEW           # the directory tree
+vfs object show OBJECT_ID
+vfs object name OBJECT_ID [NEWNAME]
 ```
 
 There is no "paths for an object across views" command, because an object's
-locations are computed; `viewfs dir ls` and `viewfs find --prop` answer
+locations are computed; `vfs dir ls` and `vfs find --prop` answer
 "where does this appear" by query.
 
 ## 8. View Definition Requirements
@@ -401,10 +401,10 @@ Object, property, view, directory, and filter metadata are held in PostgreSQL.
 The backing store location shall be configurable:
 
 ```sh
-viewfs init STORE_PATH
+vfs init STORE_PATH
 ```
 
-`viewfs init` shall create the PostgreSQL database if it does not already
+`vfs init` shall create the PostgreSQL database if it does not already
 exist (connecting to a maintenance database to issue `CREATE DATABASE`),
 provided the connecting role has the privilege to do so, and then create the
 schema and apply migrations. Tearing the system down (the `DestroyAll.sh` helper)
@@ -497,38 +497,38 @@ mount.
 
 ## 13. Command-Line Tool Requirements
 
-The project shall provide a tool named `viewfs`. It shall support at least:
+The project shall provide a tool named `vfs`. It shall support at least:
 
 ### 13.1 Repository
 
 ```sh
-viewfs init STORE_PATH
-viewfs status
-viewfs check
+vfs init STORE_PATH
+vfs status
+vfs check
 ```
 
 ### 13.2 Views
 
 ```sh
-viewfs view create VIEW [DESCRIPTION]
-viewfs view list
-viewfs view delete VIEW
-viewfs view show   VIEW
+vfs view create VIEW [DESCRIPTION]
+vfs view list
+vfs view delete VIEW
+vfs view show   VIEW
 ```
 
 ### 13.3 Mounting
 
 ```sh
-viewfs mount   VIEW MOUNTPOINT [--ro] [--foreground] [--verbose]
-viewfs unmount MOUNTPOINT          # may wrap fusermount3 -u
+vfs mount   VIEW MOUNTPOINT [--ro] [--foreground] [--verbose]
+vfs unmount MOUNTPOINT          # may wrap fusermount3 -u
 ```
 
 ### 13.4 Directories
 
 ```sh
-viewfs dir mkdir   [VIEW] DIR
-viewfs dir rmdir   [VIEW] DIR
-viewfs dir ls      [[VIEW] DIR]
+vfs dir mkdir   [VIEW] DIR
+vfs dir rmdir   [VIEW] DIR
+vfs dir ls      [[VIEW] DIR]
 ```
 
 Directory *filters* are managed with `prop` (§13.6), addressing the directory
@@ -537,27 +537,27 @@ as `VIEW:DIR` (or by path/cwd inside a mount).
 ### 13.5 Objects
 
 ```sh
-viewfs object import SOURCE_PATH [--name NAME] [--into VIEW:DIR]...
-viewfs object show   OBJECT_ID
-viewfs object name   OBJECT_ID [NEWNAME]
-viewfs object copy   OBJECT_ID VIEW:DIR
-viewfs object id     VIEW VIEW_PATH
-viewfs object list   [--orphaned]
-viewfs object delete OBJECT_ID
-viewfs object delete --orphaned [--dry-run]
+vfs object import SOURCE_PATH [--name NAME] [--into VIEW:DIR]...
+vfs object show   OBJECT_ID
+vfs object name   OBJECT_ID [NEWNAME]
+vfs object copy   OBJECT_ID VIEW:DIR
+vfs object id     VIEW VIEW_PATH
+vfs object list   [--orphaned]
+vfs object delete OBJECT_ID
+vfs object delete --orphaned [--dry-run]
 ```
 
 ### 13.6 Properties (files and directory filters)
 
-`TARGET` is an object id, a `VIEW:DIR`, or — inside a mount — a path/name
-(or omitted, meaning the current directory). `--flow`/`--effective` apply to
-directory targets only.
+`TARGET` is an object id, a `VIEW:DIR`, or — inside a mount — a path/name.
+It is optional on every subcommand and defaults to the current directory.
+`--flow`/`--effective` apply to directory targets only.
 
 ```sh
-viewfs prop set    TARGET KEY VALUE [--flow]
-viewfs prop unset  TARGET KEY [VALUE]
-viewfs prop list   [TARGET] [--effective]
-viewfs find --prop KEY[=VALUE] [--prop KEY[=VALUE]]...
+vfs prop set    [TARGET] KEY VALUE [--flow]
+vfs prop unset  [TARGET] KEY [VALUE]
+vfs prop list   [TARGET] [--effective]
+vfs find --prop KEY[=VALUE] [--prop KEY[=VALUE]]...
 ```
 
 ## 14. Data Model Requirements
@@ -615,21 +615,21 @@ properties (and therefore match only empty-filter directories such as view
 roots):
 
 ```sh
-viewfs object list --orphaned
+vfs object list --orphaned
 ```
 
 It shall provide explicit object deletion; deletion of object content shall be
 explicit (`unlink` through the mount also deletes — §7.7):
 
 ```sh
-viewfs object delete OBJECT_ID
+vfs object delete OBJECT_ID
 ```
 
 ## 16. Logging and Diagnostics
 
 The prototype shall provide: a verbose mode for the FUSE daemon; clear CLI
 error messages; a way to inspect backing-store/database status (`viewfs
-status`); a metadata consistency check (`viewfs check`) covering DB integrity
+status`); a metadata consistency check (`vfs check`) covering DB integrity
 (propertyless objects, unreachable or structurally inconsistent directories,
 orphan property rows), content↔object cross-checks, schema version, and
 checksum coverage; and logs sufficient to debug path resolution.
@@ -658,7 +658,7 @@ The project shall include automated tests covering at minimum:
     addressable (`name~idprefix`).
 15. Persistence of views, directories, filters, and properties across
     unmount and remount.
-16. `viewfs check` detecting a deleted content file.
+16. `vfs check` detecting a deleted content file.
 17. Power-loss resilience: after a `close(2)` and a hard kill of the daemon,
     the store is consistent and the bytes survive remount.
 18. `..` traversal handled safely.
@@ -694,8 +694,8 @@ sudo dnf install fuse3 fuse3-devel libpq libpq-devel \
                  gcc make pkgconf-pkg-config postgresql
 ```
 
-The project shall build with `make`, producing the `viewfs` CLI and the
-`viewfs-fuse` daemon.
+The project shall build with `make`, producing the `vfs` CLI and the
+`vfs-fuse` daemon.
 
 ## 20. Documentation Requirements
 
@@ -750,7 +750,7 @@ viewfs/
   src/
     libviewfs/   (store, objects, object_props, view_dirs, members, find, …)
     cli/         (viewfs: view, dir, object, prop, find, mount, check, …)
-    fuse/        (viewfs-fuse daemon: membership-driven callbacks)
+    fuse/        (vfs-fuse daemon: membership-driven callbacks)
   tests/
     unit/        (canonicalizer, object id, property model)
     integration/ (end-to-end: dirs/props, mount read/write, dup names, check, crash)

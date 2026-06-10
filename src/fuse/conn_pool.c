@@ -33,7 +33,7 @@ PGconn *conn_pool_get(conn_pool *p) {
     const char *ci = p->conninfo[0] ? p->conninfo : NULL;
     PGconn *nc = PQconnectdb(ci ? ci : "");
     if (PQstatus(nc) != CONNECTION_OK) {
-        fprintf(stderr, "viewfs-fuse: libpq connect failed: %s",
+        fprintf(stderr, "vfs-fuse: libpq connect failed: %s",
                 PQerrorMessage(nc));
         PQfinish(nc);
         return NULL;
@@ -43,7 +43,7 @@ PGconn *conn_pool_get(conn_pool *p) {
     snprintf(sql, sizeof sql, "SET search_path TO \"%s\"", p->schema);
     PGresult *r = PQexec(nc, sql);
     if (PQresultStatus(r) != PGRES_COMMAND_OK) {
-        fprintf(stderr, "viewfs-fuse: SET search_path failed: %s",
+        fprintf(stderr, "vfs-fuse: SET search_path failed: %s",
                 PQresultErrorMessage(r));
         PQclear(r);
         PQfinish(nc);

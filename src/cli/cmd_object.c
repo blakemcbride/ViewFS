@@ -7,7 +7,7 @@
 
 static void print_usage(FILE *out) {
     fprintf(out,
-"Usage: viewfs object <subcommand> [args]\n"
+"Usage: vfs object <subcommand> [args]\n"
 "  object import HOST_PATH [--name NAME] [--into VIEW:DIR]...\n"
 "  object show ID|PREFIX\n"
 "  object name ID|PREFIX [NEWNAME]\n"
@@ -70,7 +70,7 @@ static int sub_import(int argc, char **argv, vfs_store *s) {
         const char *t = cli_take_flag(&argc, argv, "--into", 0);
         if (!t) break;
         if (nintos >= 16) {
-            fprintf(stderr, "viewfs: too many --into flags (max 16)\n");
+            fprintf(stderr, "vfs: too many --into flags (max 16)\n");
             return 2;
         }
         intos[nintos++] = t;
@@ -107,12 +107,12 @@ static int sub_import(int argc, char **argv, vfs_store *s) {
         char view[128];
         const char *dir = NULL;
         if (split_view_dir(intos[i], view, sizeof view, &dir) != 0) {
-            fprintf(stderr, "viewfs: --into expects VIEW:DIR (got '%s')\n", intos[i]);
+            fprintf(stderr, "vfs: --into expects VIEW:DIR (got '%s')\n", intos[i]);
             continue;
         }
         rc = assign_dir_props(s, &id, view, dir);
         if (rc != VFS_OK)
-            fprintf(stderr, "viewfs: --into %s: %s (%s)\n",
+            fprintf(stderr, "vfs: --into %s: %s (%s)\n",
                     intos[i], vfs_error_str(rc), vfs_store_last_error(s));
         else
             printf("  -> %s:%s (gained dir properties)\n", view, dir);
@@ -183,7 +183,7 @@ static int sub_copy(int argc, char **argv, vfs_store *s) {
     vfs_error rc = vfs_object_get(s, &src, &info);
     if (rc != VFS_OK) return cli_perror(s, rc, "object copy");
     if (strcmp(info.kind, "file") != 0) {
-        fprintf(stderr, "viewfs: object copy only supports file objects\n");
+        fprintf(stderr, "vfs: object copy only supports file objects\n");
         return 1;
     }
     char srcpath[VFS_PATH_MAX];
@@ -229,18 +229,18 @@ static int sub_id(int argc, char **argv, vfs_store *s) {
     vfs_error rc = vfs_path_canonicalize(path, &cp);
     if (rc != VFS_OK) return cli_perror(s, rc, "object id");
     if (cp.is_root) {
-        fprintf(stderr, "viewfs: %s:%s is a directory\n", view, path);
+        fprintf(stderr, "vfs: %s:%s is a directory\n", view, path);
         return 1;
     }
     const char *parent = cp.parent[0] ? cp.parent : "/";
     vfs_object_id id;
     rc = vfs_dir_member_by_name(s, view, parent, cp.name, &id);
     if (rc == VFS_ERR_NOTFOUND) {
-        fprintf(stderr, "viewfs: no file %s:%s\n", view, path);
+        fprintf(stderr, "vfs: no file %s:%s\n", view, path);
         return 1;
     }
     if (rc == VFS_ERR_AMBIGUOUS) {
-        fprintf(stderr, "viewfs: %s:%s is ambiguous (multiple matches)\n", view, path);
+        fprintf(stderr, "vfs: %s:%s is ambiguous (multiple matches)\n", view, path);
         return 1;
     }
     if (rc != VFS_OK) return cli_perror(s, rc, "object id");
@@ -270,7 +270,7 @@ static void orphan_delete_cb(const vfs_object_info *o, void *ud) {
     vfs_error rc = vfs_object_delete(c->store, &o->id);
     if (rc == VFS_OK) { printf("deleted %s\n", o->id.hex); c->deleted++; }
     else {
-        fprintf(stderr, "viewfs: failed to delete %s: %s (%s)\n",
+        fprintf(stderr, "vfs: failed to delete %s: %s (%s)\n",
                 o->id.hex, vfs_error_str(rc), vfs_store_last_error(c->store));
         c->failed++;
     }
@@ -282,7 +282,7 @@ static int sub_delete(int argc, char **argv, vfs_store *s) {
 
     if (orphaned) {
         if (argc != 3) {
-            fprintf(stderr, "viewfs: object delete --orphaned takes no id\n");
+            fprintf(stderr, "vfs: object delete --orphaned takes no id\n");
             return 2;
         }
         struct orphan_delete_ctx c = { .store = s, .dry_run = dry_run != NULL };
@@ -293,7 +293,7 @@ static int sub_delete(int argc, char **argv, vfs_store *s) {
         return c.failed ? 1 : 0;
     }
     if (dry_run) {
-        fprintf(stderr, "viewfs: --dry-run only applies with --orphaned\n");
+        fprintf(stderr, "vfs: --dry-run only applies with --orphaned\n");
         return 2;
     }
     if (argc != 4) return usage();

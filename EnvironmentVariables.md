@@ -3,21 +3,21 @@
 Every environment variable that affects ViewFS, grouped by what reads it.
 "Required" means the named tool fails (or can't do useful work) without it.
 
-## 1. Read by the `viewfs` CLI and `viewfs-fuse` daemon
+## 1. Read by the `vfs` CLI and `vfs-fuse` daemon
 
 | Variable | Required? | Default | Read by / notes |
 |---|---|---|---|
-| `VIEWFS_STORE` | Effectively yes, unless you pass the path another way | *(none)* | Backing-store directory. Used by every CLI command (as the fallback for `--store`) and by `viewfs mount`. You can instead pass `--store PATH` on any command, or the positional `STORE_PATH` to `viewfs init`. `--store` also *sets* `VIEWFS_STORE` for the rest of that process. |
-| `VIEWFS_PG_USER` | No | libpq default (`PGUSER`, else your OS login name) | Consulted **only by `viewfs init`**, and **only when `--pg` is not given**, to synthesize the PostgreSQL conninfo. |
-| `VIEWFS_PG_DATABASE` | No | `viewfs` | Consulted **only by `viewfs init`** when `--pg` is not given. |
+| `VIEWFS_STORE` | Effectively yes, unless you pass the path another way | *(none)* | Backing-store directory. Used by every CLI command (as the fallback for `--store`) and by `vfs mount`. You can instead pass `--store PATH` on any command, or the positional `STORE_PATH` to `vfs init`. `--store` also *sets* `VIEWFS_STORE` for the rest of that process. |
+| `VIEWFS_PG_USER` | No | libpq default (`PGUSER`, else your OS login name) | Consulted **only by `vfs init`**, and **only when `--pg` is not given**, to synthesize the PostgreSQL conninfo. |
+| `VIEWFS_PG_DATABASE` | No | `viewfs` | Consulted **only by `vfs init`** when `--pg` is not given. |
 
-`viewfs init` **creates the database if it does not exist** (it connects to a
+`vfs init` **creates the database if it does not exist** (it connects to a
 maintenance database — `postgres`, falling back to `template1` — with the
 same host/user and issues `CREATE DATABASE`), provided the connecting role
 has the `CREATEDB` privilege. It then creates the schema and applies
 migrations.
 
-After `viewfs init`, the full PostgreSQL conninfo and schema name are written
+After `vfs init`, the full PostgreSQL conninfo and schema name are written
 into `$STORE/config.toml`. **Every later command and the daemon read the
 conninfo from there**, so `VIEWFS_PG_USER` / `VIEWFS_PG_DATABASE` are not
 needed again.
@@ -25,11 +25,11 @@ needed again.
 ### Minimum to get going
 ```sh
 export VIEWFS_STORE=/path/to/store     # the one var worth setting
-./viewfs init                          # uses $VIEWFS_STORE; PG via libpq defaults
+./vfs init                          # uses $VIEWFS_STORE; PG via libpq defaults
 ```
 If your local PostgreSQL needs a specific role (e.g. the dev/test setup uses
 `postgres`), either also `export VIEWFS_PG_USER=postgres` before `init`, or
-pass `viewfs init --pg "host=/var/run/postgresql user=postgres dbname=viewfs"`.
+pass `vfs init --pg "host=/var/run/postgresql user=postgres dbname=viewfs"`.
 
 ## 2. Standard libpq variables (fallback at connect time)
 
@@ -52,7 +52,7 @@ defaults. The common ones:
 
 `DestroyAll.sh` is **teardown-only**: it unmounts any live ViewFS mounts, drops the
 whole Postgres **database**, and deletes the object store. It does **not**
-recreate anything — run `viewfs init` afterward (which recreates the database
+recreate anything — run `vfs init` afterward (which recreates the database
 and schema).
 
 | Variable | Required? | Default | Notes |

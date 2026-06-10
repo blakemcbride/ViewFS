@@ -6,9 +6,9 @@
 
 static void print_usage(FILE *out) {
     fprintf(out,
-"viewfs %s -- view-based filesystem admin tool\n"
+"vfs %s -- view-based filesystem admin tool\n"
 "\n"
-"Usage: viewfs <command> [options...]\n"
+"Usage: vfs <command> [options...]\n"
 "\n"
 "Repository:\n"
 "  init [STORE_PATH] [--pg CONNINFO] [--schema NAME] [--reinit]\n"
@@ -37,8 +37,8 @@ static void print_usage(FILE *out) {
 "  object delete --orphaned [--dry-run]\n"
 "\n"
 "Properties (on a file OR a directory's membership filter; multi-valued):\n"
-"  prop set    TARGET KEY VALUE [--flow]\n"
-"  prop unset  TARGET KEY [VALUE]\n"
+"  prop set    [TARGET] KEY VALUE [--flow]\n"
+"  prop unset  [TARGET] KEY [VALUE]\n"
 "  prop list   [TARGET] [--effective]\n"
 "  find --prop KEY[=VALUE] [--prop KEY[=VALUE]]...\n"
 "  TARGET: a path/name in your mount, VIEW:DIR, an object ID, or omitted=cwd\n"
@@ -84,7 +84,7 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (strcmp(cmd, "--version") == 0 || strcmp(cmd, "-V") == 0) {
-        printf("viewfs %s\n", viewfs_version_string());
+        printf("vfs %s\n", viewfs_version_string());
         return 0;
     }
 
@@ -100,7 +100,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "unmount")) return cmd_unmount(argc, argv);
     if (!strcmp(cmd, "check"))   return cmd_check  (argc, argv);
 
-    fprintf(stderr, "viewfs: unknown command '%s'\n", cmd);
-    fprintf(stderr, "Run 'viewfs --help' for usage.\n");
+    fprintf(stderr, "vfs: unknown command '%s'\n", cmd);
+    fprintf(stderr, "Run 'vfs --help' for usage.\n");
     return 2;
 }

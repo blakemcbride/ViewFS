@@ -9,16 +9,16 @@
 
 static int usage(void) {
     fprintf(stderr,
-"Usage: viewfs mount VIEW [--ro] [--foreground] [--verbose] MOUNTPOINT\n"
+"Usage: vfs mount VIEW [--ro] [--foreground] [--verbose] MOUNTPOINT\n"
 "\n"
-"  Delegates to viewfs-fuse. The daemon backgrounds itself unless\n"
+"  Delegates to vfs-fuse. The daemon backgrounds itself unless\n"
 "  --foreground is given.\n");
     return 2;
 }
 
-/* Find the viewfs-fuse binary next to the running viewfs binary, else
+/* Find the vfs-fuse binary next to the running vfs binary, else
  * rely on PATH lookup. Returns a malloc'd path or NULL (meaning use
- * execvp("viewfs-fuse", ...)). */
+ * execvp("vfs-fuse", ...)). */
 static char *locate_daemon(void) {
     char self[4096];
     ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
@@ -26,7 +26,7 @@ static char *locate_daemon(void) {
     self[n] = '\0';
     char *dir = dirname(self);
     char path[4096];
-    snprintf(path, sizeof path, "%s/viewfs-fuse", dir);
+    snprintf(path, sizeof path, "%s/vfs-fuse", dir);
     if (access(path, X_OK) == 0) return strdup(path);
     return NULL;
 }
@@ -46,12 +46,12 @@ int cmd_mount(int argc, char **argv) {
     const char *store = getenv("VIEWFS_STORE");
     if (!store || !*store) {
         fprintf(stderr,
-            "viewfs: store path required (pass --store PATH or set VIEWFS_STORE)\n");
+            "vfs: store path required (pass --store PATH or set VIEWFS_STORE)\n");
         return 2;
     }
 
     char *daemon_path = locate_daemon();
-    const char *prog = daemon_path ? daemon_path : "viewfs-fuse";
+    const char *prog = daemon_path ? daemon_path : "vfs-fuse";
 
     char *cargv[16];
     int  c = 0;
@@ -65,7 +65,7 @@ int cmd_mount(int argc, char **argv) {
     cargv[c]   = NULL;
 
     execvp(prog, cargv);
-    fprintf(stderr, "viewfs: failed to exec %s: %s\n", prog, strerror(errno));
+    fprintf(stderr, "vfs: failed to exec %s: %s\n", prog, strerror(errno));
     free(daemon_path);
     return 127;
 }

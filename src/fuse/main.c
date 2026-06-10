@@ -9,9 +9,9 @@
 
 static void print_usage(FILE *out) {
     fprintf(out,
-"viewfs-fuse %s -- view-based filesystem FUSE daemon\n"
+"vfs-fuse %s -- view-based filesystem FUSE daemon\n"
 "\n"
-"Usage: viewfs-fuse --store STORE_PATH --view VIEW_NAME MOUNTPOINT [opts]\n"
+"Usage: vfs-fuse --store STORE_PATH --view VIEW_NAME MOUNTPOINT [opts]\n"
 "\n"
 "Options:\n"
 "  --store PATH        backing store directory (required)\n"
@@ -60,7 +60,7 @@ int main(int argc, char **argv) {
             return 0;
         }
         if (!strcmp(argv[i], "--version") || !strcmp(argv[i], "-V")) {
-            printf("viewfs-fuse %s\n", viewfs_version_string());
+            printf("vfs-fuse %s\n", viewfs_version_string());
             return 0;
         }
     }
@@ -85,7 +85,7 @@ int main(int argc, char **argv) {
     vfs_store *store = NULL;
     vfs_error rc = vfs_store_open(store_path, &store);
     if (rc != VFS_OK) {
-        fprintf(stderr, "viewfs-fuse: cannot open store %s\n", store_path);
+        fprintf(stderr, "vfs-fuse: cannot open store %s\n", store_path);
         return 1;
     }
 
@@ -93,13 +93,13 @@ int main(int argc, char **argv) {
     int exists = 0;
     rc = vfs_view_exists(store, view_name, &exists);
     if (rc != VFS_OK) {
-        fprintf(stderr, "viewfs-fuse: view lookup failed: %s\n",
+        fprintf(stderr, "vfs-fuse: view lookup failed: %s\n",
                 vfs_store_last_error(store));
         vfs_store_close(store);
         return 1;
     }
     if (!exists) {
-        fprintf(stderr, "viewfs-fuse: view '%s' does not exist in %s\n",
+        fprintf(stderr, "vfs-fuse: view '%s' does not exist in %s\n",
                 view_name, store_path);
         vfs_store_close(store);
         return 1;
@@ -114,7 +114,7 @@ int main(int argc, char **argv) {
     static conn_pool POOL;
     rc = conn_pool_init(&POOL, vfs_store_conninfo(store), vfs_store_schema(store));
     if (rc != VFS_OK) {
-        fprintf(stderr, "viewfs-fuse: conn_pool init failed\n");
+        fprintf(stderr, "vfs-fuse: conn_pool init failed\n");
         vfs_store_close(store);
         return 1;
     }
@@ -133,7 +133,7 @@ int main(int argc, char **argv) {
 
     char *fuse_argv[16];
     int fa = 0;
-    fuse_argv[fa++] = (char*)"viewfs-fuse";
+    fuse_argv[fa++] = (char*)"vfs-fuse";
     fuse_argv[fa++] = (char*)"-o"; fuse_argv[fa++] = (char*)"default_permissions";
     fuse_argv[fa++] = (char*)"-o"; fuse_argv[fa++] = fsname_opt;
     if (CTX.read_only) {

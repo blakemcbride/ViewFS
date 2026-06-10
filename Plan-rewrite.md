@@ -79,7 +79,7 @@ overridden before Phase 1 starts.
   the source object's other props" clause of the brief cannot be honored
   from `create`+`write` alone. The richer copy (duplicate content, drop
   source-dir pairs, gain dest-dir pairs, **retain all other props**) is
-  provided as an object-level CLI command `viewfs object copy`. `mv`
+  provided as an object-level CLI command `vfs object copy`. `mv`
   through the mount *does* get full move semantics (§5, `op_rename`)
   because FUSE hands us both endpoints of the same object.
 
@@ -269,8 +269,8 @@ property change with no obvious "parent" emits a view-wide invalidation
 
 ## 6. CLI surface
 
-Removed: `viewfs view add`, `viewfs view remove`, `viewfs view populate`,
-`viewfs attr *`, `viewfs tag *` (the old explicit-mapping and
+Removed: `vfs view add`, `vfs view remove`, `vfs view populate`,
+`vfs attr *`, `vfs tag *` (the old explicit-mapping and
 informational-attribute commands).
 
 Added / changed:
@@ -280,35 +280,35 @@ Added / changed:
 # both a file's properties and a directory's filter; the TARGET decides
 # which. TARGET = object ID|PREFIX, VIEW:DIR, or a path/name in a mount
 # (omitted = the current directory). --flow/--effective: directory targets.
-viewfs prop set    TARGET KEY VALUE [--flow]    # add/set a pair
-viewfs prop unset  TARGET KEY [VALUE]           # remove one value, or all of KEY
-viewfs prop list   [TARGET] [--effective]
+vfs prop set    TARGET KEY VALUE [--flow]    # add/set a pair
+vfs prop unset  TARGET KEY [VALUE]           # remove one value, or all of KEY
+vfs prop list   [TARGET] [--effective]
 
-viewfs object name  ID|PREFIX [NEWNAME]         # get/set the intrinsic name
-viewfs object copy  ID|PREFIX VIEW:DIR          # D4 full copy: dup content,
+vfs object name  ID|PREFIX [NEWNAME]         # get/set the intrinsic name
+vfs object copy  ID|PREFIX VIEW:DIR          # D4 full copy: dup content,
                                                 # gain DIR's effective pairs, keep the rest
 
 # Directory tree (filters are managed with `prop` above).
-viewfs dir mkdir   [VIEW] DIR                    # also creatable via mount mkdir
-viewfs dir rmdir   [VIEW] DIR
-viewfs dir ls      [[VIEW] DIR]                  # show computed contents
+vfs dir mkdir   [VIEW] DIR                    # also creatable via mount mkdir
+vfs dir rmdir   [VIEW] DIR
+vfs dir ls      [[VIEW] DIR]                  # show computed contents
 
 # Find, re-expressed over properties (multi-value aware).
-viewfs find --prop KEY[=VALUE] [--prop KEY[=VALUE] ...]   # AND across pairs
+vfs find --prop KEY[=VALUE] [--prop KEY[=VALUE] ...]   # AND across pairs
 ```
 
 > **CLI evolution note.** An earlier iteration exposed directory filters via
-> a separate `viewfs dir prop …` subcommand. That was folded into `viewfs
+> a separate `vfs dir prop …` subcommand. That was folded into `viewfs
 > prop` (targets distinguish a file from a directory), and `prop`/`dir`
 > commands gained cwd/path inference inside a mount. The text above reflects
 > the current surface.
 
-`viewfs object import HOST_PATH [--into VIEW:DIR]` keeps its shape, but
+`vfs object import HOST_PATH [--into VIEW:DIR]` keeps its shape, but
 `--into VIEW:DIR` now means "assign `effective(V,DIR)`'s pairs to the
 imported object" (so it appears in `DIR`) instead of inserting a mapping
 row. `--name` overrides the derived basename.
 
-`viewfs check` and `viewfs status` lose their `mappings` queries
+`vfs check` and `vfs status` lose their `mappings` queries
 (`cmd_check.c`, `cmd_status.c`) and gain:
 - orphan objects = objects matching no directory in any view (was: zero
   mappings);
@@ -384,7 +384,7 @@ and its own tests before the next begins.
   `import --into`, `find --prop`, `check`/`status` re-point.
 - **Exit:** a shell session can `init`, create a view, `dir mkdir`,
   attach dir props (with/without `--flow`), import objects with props,
-  and see correct membership via `viewfs dir ls` — including a flowed
+  and see correct membership via `vfs dir ls` — including a flowed
   pair visible to a child dir and an independent pair that is not.
 
 ### Phase R2 — FUSE read path over membership
@@ -413,7 +413,7 @@ and its own tests before the next begins.
   cascading to a child, and `mv` re-homing a file by property edit.
 
 ### Phase R5 — `check`/diagnostics polish & crash test  *(done)*
-- `viewfs check` invariants for the property model: propertyless objects
+- `vfs check` invariants for the property model: propertyless objects
   (informational), directories with a missing parent, directories with an
   inconsistent `name`/`parent_path` (`vfs_check_dir_structure`), and orphan
   `object_props` rows; content↔object cross-check and checksum coverage
@@ -432,10 +432,10 @@ and its own tests before the next begins.
 | Risk | Mitigation |
 |---|---|
 | Membership query cost on large stores (relational division per readdir) | `object_props_kv` index + `HAVING count(*)=n` plan; cache effective sets per directory in the daemon, invalidated by NOTIFY. |
-| Empty-prop directory dumps the entire object table into one `ls` | Documented and intentional (root behaves this way). `viewfs dir ls` warns when `n=0`. |
-| Name collisions across many matching objects | D2 suffixing; `viewfs object name` to rename; collisions logged under `--verbose`. |
-| Through-the-mount `cp` cannot retain source object's extra props | D4: `viewfs object copy` is the lossless path; README documents the mount `cp` limitation. |
-| Flow semantics confusing (which pairs cascade) | `viewfs dir prop list --effective` shows the resolved set with the source directory of each flowed pair. |
+| Empty-prop directory dumps the entire object table into one `ls` | Documented and intentional (root behaves this way). `vfs dir ls` warns when `n=0`. |
+| Name collisions across many matching objects | D2 suffixing; `vfs object name` to rename; collisions logged under `--verbose`. |
+| Through-the-mount `cp` cannot retain source object's extra props | D4: `vfs object copy` is the lossless path; README documents the mount `cp` limitation. |
+| Flow semantics confusing (which pairs cascade) | `vfs dir prop list --effective` shows the resolved set with the source directory of each flowed pair. |
 | `mv` causing a file to also (dis)appear from unrelated directories | Inherent to a global-by-property model; documented. The set that changes is exactly the objects matching the swapped pairs. |
 
 ---

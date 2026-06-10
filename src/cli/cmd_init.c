@@ -42,7 +42,7 @@ int cmd_init(int argc, char **argv) {
     }
     if (!store_path || argc > 3) {
         fprintf(stderr,
-"Usage: viewfs init [STORE_PATH] [--pg CONNINFO] [--schema NAME] [--reinit]\n"
+"Usage: vfs init [STORE_PATH] [--pg CONNINFO] [--schema NAME] [--reinit]\n"
 "\n"
 "  STORE_PATH    directory to hold config + content blobs. If omitted,\n"
 "                falls back to $VIEWFS_STORE.\n"
@@ -67,11 +67,11 @@ int cmd_init(int argc, char **argv) {
         if (!pg_db || !*pg_db) pg_db = "viewfs";  /* sensible default */
         if (pg_user && *pg_user &&
             append_conn_kv(built, sizeof built, "user", pg_user) < 0) {
-            fprintf(stderr, "viewfs init: VIEWFS_PG_USER too long\n");
+            fprintf(stderr, "vfs init: VIEWFS_PG_USER too long\n");
             return 1;
         }
         if (append_conn_kv(built, sizeof built, "dbname", pg_db) < 0) {
-            fprintf(stderr, "viewfs init: VIEWFS_PG_DATABASE too long\n");
+            fprintf(stderr, "vfs init: VIEWFS_PG_DATABASE too long\n");
             return 1;
         }
         conninfo = built;
@@ -80,13 +80,13 @@ int cmd_init(int argc, char **argv) {
     vfs_error rc = vfs_store_create(store_path, conninfo, schema, reinit);
     if (rc == VFS_ERR_EXISTS) {
         fprintf(stderr,
-            "viewfs: %s already initialized "
+            "vfs: %s already initialized "
             "(pass --reinit to overwrite config.toml)\n", store_path);
         return 1;
     }
     if (rc != VFS_OK) {
         /* vfs_store_create has already printed a detail line. */
-        fprintf(stderr, "viewfs init failed: %s\n", vfs_error_str(rc));
+        fprintf(stderr, "vfs init failed: %s\n", vfs_error_str(rc));
         return 1;
     }
     printf("Initialized ViewFS store at %s\n", store_path);

@@ -6,13 +6,13 @@
 
 static void print_usage(FILE *out) {
     fprintf(out,
-"Usage: viewfs view <subcommand> [args]\n"
+"Usage: vfs view <subcommand> [args]\n"
 "  view create NAME [\"DESCRIPTION\"]\n"
 "  view list\n"
 "  view show NAME                 list the view's directory tree\n"
 "  view delete NAME\n"
 "\n"
-"  Use `viewfs dir ...` to create directories and attach property\n"
+"  Use `vfs dir ...` to create directories and attach property\n"
 "  filters; file membership is then computed from those properties.\n");
 }
 static int usage(void) { print_usage(stderr); return 2; }
@@ -28,7 +28,7 @@ static int sub_create(int argc, char **argv, vfs_store *s) {
     const char *desc = (argc == 5) ? argv[4] : NULL;
     vfs_error rc = vfs_view_create(s, name, desc);
     if (rc == VFS_ERR_EXISTS) {
-        fprintf(stderr, "viewfs: view '%s' already exists\n", name);
+        fprintf(stderr, "vfs: view '%s' already exists\n", name);
         return 1;
     }
     if (rc != VFS_OK) return cli_perror(s, rc, "view create");
@@ -70,7 +70,7 @@ static int sub_show(int argc, char **argv, vfs_store *s) {
     vfs_error rc = vfs_view_exists(s, name, &exists);
     if (rc != VFS_OK) return cli_perror(s, rc, "view show");
     if (!exists) {
-        fprintf(stderr, "viewfs: view '%s' does not exist\n", name);
+        fprintf(stderr, "vfs: view '%s' does not exist\n", name);
         return 1;
     }
     printf("view '%s':\n", name);
@@ -84,7 +84,7 @@ static int sub_delete(int argc, char **argv, vfs_store *s) {
     const char *name = argv[3];
     vfs_error rc = vfs_view_delete(s, name);
     if (rc == VFS_ERR_NOTFOUND) {
-        fprintf(stderr, "viewfs: view '%s' does not exist\n", name);
+        fprintf(stderr, "vfs: view '%s' does not exist\n", name);
         return 1;
     }
     if (rc != VFS_OK) return cli_perror(s, rc, "view delete");

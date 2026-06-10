@@ -1,4 +1,4 @@
-/* `viewfs prop` -- manage properties on either a FILE (object) or a
+/* `vfs prop` -- manage properties on either a FILE (object) or a
  * DIRECTORY (its membership filter). One command covers both because both
  * are just (key,value) pairs; the TARGET decides which.
  *
@@ -30,18 +30,19 @@ struct prop_target {
 
 static void print_usage(FILE *out) {
     fprintf(out,
-"Usage: viewfs prop <subcommand>\n"
-"  prop set    TARGET KEY VALUE [--flow]\n"
-"  prop unset  TARGET KEY [VALUE]\n"
+"Usage: vfs prop <subcommand>\n"
+"  prop set    [TARGET] KEY VALUE [--flow]\n"
+"  prop unset  [TARGET] KEY [VALUE]\n"
 "  prop list   [TARGET] [--effective]\n"
 "\n"
-"  TARGET is what the properties belong to:\n"
-"    (omitted, list) the directory you are in (inside a mounted view)\n"
+"  TARGET is what the properties belong to; omit it to use the directory you\n"
+"  are in (inside a mounted view). Otherwise:\n"
 "    .  / path / name  resolved against your cwd; dir -> filter, file -> props\n"
 "    VIEW:DIR          a directory in any view (e.g. docs:/reports)\n"
 "    ID|PREFIX         an object (file) by id\n"
-"  A directory's pairs are its membership FILTER (--flow / --effective apply);\n"
-"  a file's pairs are the properties that decide where it appears.\n");
+"  Note: `prop unset KEY VALUE` (two words) removes VALUE of KEY from the\n"
+"  current directory; to target something else give a VIEW:DIR or a value.\n"
+"  --flow / --effective apply to directory targets.\n");
 }
 static int usage(void) { print_usage(stderr); return 2; }
 
@@ -79,7 +80,7 @@ static int resolve_target(vfs_store *s, const char *tok, struct prop_target *t) 
     if (colon && colon != tok && colon[1]) {
         char vpart[128];
         size_t vl = (size_t)(colon - tok);
-        if (vl >= sizeof vpart) { fprintf(stderr, "viewfs: view name too long\n"); return -1; }
+        if (vl >= sizeof vpart) { fprintf(stderr, "vfs: view name too long\n"); return -1; }
         memcpy(vpart, tok, vl); vpart[vl] = '\0';
         if (cli_resolve_dir(2, vpart, colon + 1, t->view, sizeof t->view,
                             t->dir, sizeof t->dir) != 0) return -1;
@@ -106,7 +107,7 @@ static int resolve_target(vfs_store *s, const char *tok, struct prop_target *t) 
                 vfs_error e = vfs_dir_member_by_name(s, rv, parent, cp.name, &t->id);
                 if (e == VFS_OK)            { t->kind = TGT_OBJECT; return 0; }
                 if (e == VFS_ERR_AMBIGUOUS) {
-                    fprintf(stderr, "viewfs: '%s' names more than one object\n", tok);
+                    fprintf(stderr, "vfs: '%s' names more than one object\n", tok);
                     return -1;
                 }
             }
@@ -116,7 +117,7 @@ static int resolve_target(vfs_store *s, const char *tok, struct prop_target *t) 
     /* Otherwise interpret tok as an object id / unique prefix. */
     if (vfs_object_resolve(s, tok, &t->id) == VFS_OK) { t->kind = TGT_OBJECT; return 0; }
 
-    fprintf(stderr, "viewfs: cannot resolve '%s' to a directory or object\n", tok);
+    fprintf(stderr, "vfs: cannot resolve '%s' to a directory or object\n", tok);
     return -1;
 }
 
@@ -137,16 +138,19 @@ int cmd_prop(int argc, char **argv) {
     int rc;
 
     if (!strcmp(sub, "set")) {
-        if (argc != 6) { rc = usage(); goto done; }       /* TARGET KEY VALUE */
-        const char *key = argv[4], *val = argv[5];
-        if (resolve_target(s, argv[3], &t)) { rc = 1; goto done; }
+        /* [TARGET] KEY VALUE: 2 positionals -> cwd, 3 -> explicit target. */
+        const char *tok, *key, *val;
+        if      (argc == 5) { tok = NULL;    key = argv[3]; val = argv[4]; }
+        else if (argc == 6) { tok = argv[3]; key = argv[4]; val = argv[5]; }
+        else { rc = usage(); goto done; }
+        if (resolve_target(s, tok, &t)) { rc = 1; goto done; }
         target_label(&t, label, sizeof label);
         vfs_error e;
         if (t.kind == TGT_DIR) {
             e = vfs_dir_prop_set(s, t.view, t.dir, key, val, flow_flag != NULL);
         } else {
             if (flow_flag) {
-                fprintf(stderr, "viewfs: --flow applies only to directories\n");
+                fprintf(stderr, "vfs: --flow applies only to directories\n");
                 rc = 2; goto done;
             }
             e = vfs_object_prop_add(s, &t.id, key, val);
@@ -155,15 +159,23 @@ int cmd_prop(int argc, char **argv) {
         else { printf("%s  %s=%s%s\n", label, key, val,
                       (t.kind == TGT_DIR && flow_flag) ? " (flow)" : ""); rc = 0; }
     } else if (!strcmp(sub, "unset")) {
-        if (argc != 5 && argc != 6) { rc = usage(); goto done; }  /* TARGET KEY [VALUE] */
-        const char *key = argv[4], *val = (argc == 6) ? argv[5] : NULL;
-        if (resolve_target(s, argv[3], &t)) { rc = 1; goto done; }
+        /* [TARGET] KEY [VALUE]. The only ambiguous case is two words: read it
+         * as "KEY VALUE on the current directory" unless the first word is a
+         * VIEW:DIR (which is unmistakably a target). */
+        const char *tok, *key, *val;
+        if      (argc == 4) { tok = NULL;    key = argv[3]; val = NULL; }
+        else if (argc == 6) { tok = argv[3]; key = argv[4]; val = argv[5]; }
+        else if (argc == 5) {
+            if (strchr(argv[3], ':')) { tok = argv[3]; key = argv[4]; val = NULL; }
+            else                      { tok = NULL;    key = argv[3]; val = argv[4]; }
+        } else { rc = usage(); goto done; }
+        if (resolve_target(s, tok, &t)) { rc = 1; goto done; }
         target_label(&t, label, sizeof label);
         vfs_error e = (t.kind == TGT_DIR)
             ? vfs_dir_prop_delete(s, t.view, t.dir, key, val)
             : vfs_object_prop_unset(s, &t.id, key, val);
         if (e == VFS_ERR_NOTFOUND) {
-            fprintf(stderr, "viewfs: %s has no matching property\n", label);
+            fprintf(stderr, "vfs: %s has no matching property\n", label);
             rc = 1;
         } else if (e != VFS_OK) {
             rc = cli_perror(s, e, "prop unset");
@@ -179,7 +191,7 @@ int cmd_prop(int argc, char **argv) {
             int exists = 0;
             vfs_dir_exists(s, t.view, t.dir, &exists);
             if (!exists) {
-                fprintf(stderr, "viewfs: no directory %s:%s\n", t.view, t.dir);
+                fprintf(stderr, "vfs: no directory %s:%s\n", t.view, t.dir);
                 rc = 1; goto done;
             }
             int effective = eff_flag != NULL;
@@ -189,7 +201,7 @@ int cmd_prop(int argc, char **argv) {
             rc = (e == VFS_OK) ? 0 : cli_perror(s, e, "prop list");
         } else {
             if (eff_flag) {
-                fprintf(stderr, "viewfs: --effective applies only to directories\n");
+                fprintf(stderr, "vfs: --effective applies only to directories\n");
                 rc = 2; goto done;
             }
             printf("properties of %s:\n", t.id.hex);

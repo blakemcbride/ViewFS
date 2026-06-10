@@ -94,14 +94,14 @@ sudo systemctl enable --now postgresql
 
 ### Database
 
-You do **not** need to create the database by hand: `viewfs init` creates it
+You do **not** need to create the database by hand: `vfs init` creates it
 automatically if it is missing (it connects to the `postgres` maintenance
 database and runs `CREATE DATABASE`), provided the connecting role has the
 `CREATEDB` privilege. You only need a role ViewFS can connect as.
 
 You can connect as the system `postgres` superuser, or as a dedicated user —
 both work. The simplest "dev box" setup uses the `postgres` role over the
-local Unix socket and needs no further setup; `viewfs init` will create the
+local Unix socket and needs no further setup; `vfs init` will create the
 `viewfs` database on first run.
 
 To connect as your own login user instead (so you don't need `sudo -u` for
@@ -149,8 +149,8 @@ make
 
 This produces two binaries in the project directory:
 
-- `./viewfs`       — the admin CLI
-- `./viewfs-fuse`  — the FUSE daemon
+- `./vfs`       — the admin CLI
+- `./vfs-fuse`  — the FUSE daemon
 
 A clean rebuild:
 
@@ -217,7 +217,7 @@ directory on each invocation so it never touches a real store.
 
 ## 7. Install system-wide (optional)
 
-For development you can keep using `./viewfs` and `./viewfs-fuse`
+For development you can keep using `./vfs` and `./vfs-fuse`
 from the build directory — that's how the integration tests run.
 
 For a real install:
@@ -231,7 +231,7 @@ make install DESTDIR=/tmp/staging PREFIX=/usr
 ```
 
 Both binaries land in `$PREFIX/bin` and the CLI's daemon discovery
-picks them up automatically — `viewfs mount` looks for `viewfs-fuse`
+picks them up automatically — `vfs mount` looks for `vfs-fuse`
 next to itself via `/proc/self/exe`, then falls back to `PATH`.
 
 To remove:
@@ -258,7 +258,7 @@ Initialize that store (creates the directory and the PostgreSQL schema).
 
 ```sh
 export VIEWFS_PG_USER=postgres
-viewfs init "$VIEWFS_STORE"
+vfs init "$VIEWFS_STORE"
 ```
 
 For anything beyond user and database (custom host, port, sslmode,
@@ -279,7 +279,7 @@ Either create the role (`sudo -u postgres createuser -s "$USER"`) or
 include `user=postgres` in your conninfo and rely on local-socket
 trust auth.
 
-**`viewfs unmount` says "fusermount3: not found".**
+**`vfs unmount` says "fusermount3: not found".**
 Install the `fuse3` package (which provides the setuid helper).
 
 **`make test` hangs.**
@@ -295,7 +295,7 @@ harness uses the same string.
 
 **Daemon won't start with "schema 'viewfs' does not exist".**
 You probably edited `config.toml` to point at a schema name that was
-never created. Re-run `viewfs init --reinit` against the same store
+never created. Re-run `vfs init --reinit` against the same store
 path with the right `--schema` flag, or drop the bad schema and let
 init recreate it.
 

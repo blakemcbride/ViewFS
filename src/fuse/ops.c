@@ -47,7 +47,7 @@ static void trace(const char *fmt, ...) {
     if (!CTX.verbose) return;
     va_list ap;
     va_start(ap, fmt);
-    fprintf(stderr, "viewfs-fuse[%s]: ", CTX.view_name);
+    fprintf(stderr, "vfs-fuse[%s]: ", CTX.view_name);
     vfprintf(stderr, fmt, ap);
     fputc('\n', stderr);
     va_end(ap);
@@ -980,7 +980,7 @@ static void *op_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
     if (f) { fprintf(f, "%d\n", getpid()); fclose(f); }
 
     if (notify_thread_start(&CTX) != 0) {
-        fprintf(stderr, "viewfs-fuse: notify thread failed; cache disabled\n");
+        fprintf(stderr, "vfs-fuse: notify thread failed; cache disabled\n");
         cfg->attr_timeout = cfg->entry_timeout = cfg->negative_timeout = 0.0;
     }
     trace("mounted view='%s' ro=%d", CTX.view_name, CTX.read_only);

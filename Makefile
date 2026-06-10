@@ -35,8 +35,8 @@ CLI_OBJ  := $(patsubst src/cli/%.c,$(CLI_DIR)/%.o,$(CLI_SRC))
 FUSE_OBJ := $(patsubst src/fuse/%.c,$(FUSE_DIR)/%.o,$(FUSE_SRC))
 
 LIB_AR   := $(BUILD_DIR)/libviewfs.a
-CLI_BIN  := viewfs
-FUSE_BIN := viewfs-fuse
+CLI_BIN  := vfs
+FUSE_BIN := vfs-fuse
 
 .PHONY: all clean test unit-test int-test install uninstall help
 .DEFAULT_GOAL := all
@@ -54,14 +54,14 @@ $(LIB_DIR)/%.o: src/libviewfs/%.c | $(LIB_DIR)
 $(LIB_AR): $(LIB_OBJ)
 	ar rcs $@ $^
 
-# viewfs CLI ------------------------------------------------------------------
+# vfs CLI ------------------------------------------------------------------
 $(CLI_DIR)/%.o: src/cli/%.c | $(CLI_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(PKG_LIBPQ_CFLAGS) -c $< -o $@
 
 $(CLI_BIN): $(CLI_OBJ) $(LIB_AR)
 	$(CC) $(CFLAGS) $(CLI_OBJ) $(LIB_AR) $(PKG_LIBPQ_LIBS) $(PKG_CRYPTO_LIBS) -o $@ $(LDFLAGS)
 
-# viewfs-fuse daemon ----------------------------------------------------------
+# vfs-fuse daemon ----------------------------------------------------------
 $(FUSE_DIR)/%.o: src/fuse/%.c | $(FUSE_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(PKG_FUSE3_CFLAGS) $(PKG_LIBPQ_CFLAGS) -c $< -o $@
 
@@ -119,7 +119,7 @@ uninstall:
 
 help:
 	@echo "Targets:"
-	@echo "  all          (default) build viewfs and viewfs-fuse"
+	@echo "  all          (default) build vfs and vfs-fuse"
 	@echo "  test         run unit + integration suites"
 	@echo "  unit-test    run only the C unit tests"
 	@echo "  int-test     run only the integration suite"

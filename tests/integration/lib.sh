@@ -22,8 +22,8 @@
 set -euo pipefail
 
 TEST_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-VFS="${VFS:-$TEST_ROOT/viewfs}"
-VFS_FUSE="${VFS_FUSE:-$TEST_ROOT/viewfs-fuse}"
+VFS="${VFS:-$TEST_ROOT/vfs}"
+VFS_FUSE="${VFS_FUSE:-$TEST_ROOT/vfs-fuse}"
 PG="${VIEWFS_TEST_PG:-host=/var/run/postgresql user=postgres dbname=viewfs}"
 
 if [[ ! -x "$VFS" || ! -x "$VFS_FUSE" ]]; then

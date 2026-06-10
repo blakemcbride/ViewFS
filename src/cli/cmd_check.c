@@ -185,7 +185,7 @@ static int phase3_schema(struct findings *f) {
         fprintf(stdout, "  WARN: DB is newer; this binary may misinterpret newer columns\n");
         f->schema_drift = 1;
     } else {
-        fprintf(stdout, "  ERROR: DB is older than binary expects; re-run `viewfs init --reinit` or apply migrations\n");
+        fprintf(stdout, "  ERROR: DB is older than binary expects; re-run `vfs init --reinit` or apply migrations\n");
         f->schema_drift = -1;
     }
     return 0;
@@ -315,7 +315,7 @@ int cmd_check(int argc, char **argv) {
     if (!verbose) verbose = cli_take_flag(&argc, argv, "-v",                 1);
     if (argc != 2) {
         fprintf(stderr,
-            "Usage: viewfs check [--fix] [--fill-checksums] "
+            "Usage: vfs check [--fix] [--fill-checksums] "
             "[--verify-checksums] [--verbose]\n"
             "\n"
             "  Four-phase consistency scan + checksum-coverage report.\n"
