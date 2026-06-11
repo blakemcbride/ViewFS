@@ -80,11 +80,11 @@ note ""
 note "Each directory below is just a FILTER. Nothing is placed in them yet."
 run "$VFS" dir mkdir docs /by-author
 run "$VFS" dir mkdir docs /by-author/blake
-run "$VFS" prop set docs:/by-author/blake author blake
+run "$VFS" prop set author=blake docs:/by-author/blake
 run "$VFS" dir mkdir docs /reports
-run "$VFS" prop set docs:/reports kind report --flow
+run "$VFS" prop set kind=report docs:/reports --flow
 run "$VFS" dir mkdir docs /reports/2024
-run "$VFS" prop set docs:/reports/2024 year 2024
+run "$VFS" prop set year=2024 docs:/reports/2024
 note ""
 note "'kind=report' on /reports is marked --flow, so it cascades to"
 note "/reports/2024, whose effective filter is therefore {kind=report, year=2024}:"
@@ -99,9 +99,9 @@ run "$VFS" object import /tmp/demo-q3.txt     --into docs:/reports
 run "$VFS" object import /tmp/demo-design.txt --into docs:/by-author/blake
 # A file that satisfies BOTH the report-tree filter and the author filter:
 ANNUAL=$("$VFS" object import /tmp/demo-annual.txt | awk '{print $1}')
-run "$VFS" prop set "$ANNUAL" kind report
-run "$VFS" prop set "$ANNUAL" year 2024
-run "$VFS" prop set "$ANNUAL" author blake
+run "$VFS" prop set kind=report "$ANNUAL"
+run "$VFS" prop set year=2024 "$ANNUAL"
+run "$VFS" prop set author=blake "$ANNUAL"
 pause
 
 step "Step 4: membership is COMPUTED from those properties"
@@ -143,7 +143,7 @@ pause
 step "Step 8: a SECOND view re-filters the very same objects"
 run "$VFS" view create archive 'everything from 2024'
 run "$VFS" dir mkdir archive /2024
-run "$VFS" prop set archive:/2024 year 2024
+run "$VFS" prop set year=2024 archive:/2024
 run "$VFS" mount archive "$MNT_BASE/archive"
 sleep 0.3
 note "archive:/2024 (year=2024) surfaces the annual report — same object,"

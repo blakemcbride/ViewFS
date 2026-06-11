@@ -9,10 +9,12 @@
 
 static int usage(void) {
     fprintf(stderr,
-"Usage: vfs mount VIEW [--ro] [--foreground] [--verbose] MOUNTPOINT\n"
+"Usage: vfs mount                    list mounted views and their mountpoints\n"
+"       vfs mount VIEW [--ro] [--foreground] [--verbose] MOUNTPOINT\n"
 "\n"
-"  Delegates to vfs-fuse. The daemon backgrounds itself unless\n"
-"  --foreground is given.\n");
+"  With no arguments, lists the ViewFS views currently mounted.\n"
+"  Otherwise delegates to vfs-fuse; the daemon backgrounds itself\n"
+"  unless --foreground is given.\n");
     return 2;
 }
 
@@ -32,6 +34,12 @@ static char *locate_daemon(void) {
 }
 
 int cmd_mount(int argc, char **argv) {
+    /* `vfs mount` with no further arguments lists current mounts. */
+    if (argc == 2)
+        return cmd_mounts(argc, argv);
+    if (argc > 2 && cli_is_help_request(argv[2]))
+        return usage();
+
     const char *ro         = cli_take_flag(&argc, argv, "--ro", 1);
     const char *foreground = cli_take_flag(&argc, argv, "--foreground", 1);
     if (!foreground) foreground = cli_take_flag(&argc, argv, "-f", 1);

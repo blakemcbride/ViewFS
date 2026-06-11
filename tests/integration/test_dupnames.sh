@@ -7,7 +7,7 @@ init_store
 
 "$VFS" view create v >/dev/null
 "$VFS" dir mkdir v /d >/dev/null
-"$VFS" prop set v:/d k val >/dev/null
+"$VFS" prop set k=val v:/d >/dev/null
 
 # Two distinct objects, identical name, both matching /d.
 printf 'AAA\n' > "$STORE/a"; printf 'BBB\n' > "$STORE/b"
@@ -15,8 +15,8 @@ ida=$("$VFS" object import "$STORE/a" | awk '{print $1}')
 idb=$("$VFS" object import "$STORE/b" | awk '{print $1}')
 "$VFS" object name "$ida" report.txt >/dev/null
 "$VFS" object name "$idb" report.txt >/dev/null
-"$VFS" prop set "$ida" k val >/dev/null
-"$VFS" prop set "$idb" k val >/dev/null
+"$VFS" prop set k=val "$ida" >/dev/null
+"$VFS" prop set k=val "$idb" >/dev/null
 
 mount_view v "$MNT/v"
 
@@ -35,7 +35,7 @@ assert_contains "$got" "BBB" "other entry yields BBB"
 printf 'solo\n' > "$STORE/c"
 cid=$("$VFS" object import "$STORE/c" | awk '{print $1}')
 "$VFS" object name "$cid" unique.txt >/dev/null
-"$VFS" prop set "$cid" k val >/dev/null
+"$VFS" prop set k=val "$cid" >/dev/null
 sleep 0.2   # let the NOTIFY-driven cache invalidation land
 assert_contains "$(ls "$MNT/v/d")" "unique.txt" "uniquely-named file shown bare"
 assert_eq "$(cat "$MNT/v/d/unique.txt")" "solo" "bare name cats correctly"

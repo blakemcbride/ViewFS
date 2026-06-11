@@ -7,7 +7,7 @@
 
 int cmd_unmount(int argc, char **argv) {
     if (argc != 3) {
-        fprintf(stderr, "Usage: vfs unmount MOUNTPOINT\n");
+        fprintf(stderr, "Usage: vfs umount MOUNTPOINT\n");
         return 2;
     }
     const char *mountpoint = argv[2];

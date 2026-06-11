@@ -6,7 +6,7 @@ init_store
 
 "$VFS" view create v >/dev/null
 "$VFS" dir mkdir v /d >/dev/null
-"$VFS" prop set v:/d k val >/dev/null
+"$VFS" prop set k=val v:/d >/dev/null
 printf 'payload\n' > "$STORE/f"
 "$VFS" object import "$STORE/f" --into v:/d >/dev/null
 id=$("$VFS" object id v /d/f)

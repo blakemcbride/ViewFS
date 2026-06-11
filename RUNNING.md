@@ -4,7 +4,7 @@
 > tour (`view add`, `view remove`, `view populate`, `attr …`, `tag …`,
 > `object paths`, `find --tag/--attr`) no longer exist. The prototype is now
 > **property-driven**; see `README.md` for an up-to-date walkthrough and
-> `Plan-rewrite.md` for the model. Quick translation:
+> `Design.md` for the model. Quick translation:
 >
 > | Old | New |
 > |---|---|
@@ -586,12 +586,12 @@ as an issue class (non-zero exit).
 ## 15. Unmounting
 
 ```sh
-viewfs unmount ~/mnt/programming
-viewfs unmount ~/mnt/writing
-viewfs unmount ~/mnt/archive
+viewfs umount ~/mnt/programming
+viewfs umount ~/mnt/writing
+viewfs umount ~/mnt/archive
 ```
 
-`viewfs unmount` is a thin wrapper around `fusermount3 -u`. After it
+`viewfs umount` is a thin wrapper around `fusermount3 -u`. After it
 returns, the daemon has exited and its `daemons/<view>.pid` file is
 gone.
 
@@ -695,9 +695,9 @@ from §10 rather than the mount-and-cp workflow.
 When you're done with the tutorial state:
 
 ```sh
-viewfs unmount ~/mnt/programming  2>/dev/null
-viewfs unmount ~/mnt/writing      2>/dev/null
-viewfs unmount ~/mnt/archive      2>/dev/null
+viewfs umount ~/mnt/programming  2>/dev/null
+viewfs umount ~/mnt/writing      2>/dev/null
+viewfs umount ~/mnt/archive      2>/dev/null
 
 # Drop the PG schema (CLI doesn't currently have a dedicated command):
 psql -U "$VIEWFS_PG_USER" -d "${VIEWFS_PG_DATABASE:-viewfs}" -c 'DROP SCHEMA IF EXISTS viewfs CASCADE'

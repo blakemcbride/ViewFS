@@ -6,7 +6,7 @@ init_store
 
 "$VFS" view create v >/dev/null
 "$VFS" dir mkdir v /blake >/dev/null
-"$VFS" prop set v:/blake author blake >/dev/null
+"$VFS" prop set author=blake v:/blake >/dev/null
 printf 'alpha\n' > "$STORE/a.txt"
 "$VFS" object import "$STORE/a.txt" --into v:/blake >/dev/null
 

@@ -15,3 +15,10 @@ vfs-fuse
 
 # Generated test logs
 tests/integration/.logs/
+
+# Other local files
+BlakesNotes.txt
+EnvironmentVariables.pdf
+Rationale.pdf
+ideas.txt
+restore

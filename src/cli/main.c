@@ -37,17 +37,18 @@ static void print_usage(FILE *out) {
 "  object delete --orphaned [--dry-run]\n"
 "\n"
 "Properties (on a file OR a directory's membership filter; multi-valued):\n"
-"  prop set    [TARGET] KEY VALUE [--flow]\n"
-"  prop unset  [TARGET] KEY [VALUE]\n"
-"  prop list   [TARGET] [--effective]\n"
+"  prop set    KEY=VALUE   [TARGET...] [--flow]\n"
+"  prop unset  KEY[=VALUE] [TARGET...]\n"
+"  prop list   [TARGET...] [--effective]\n"
 "  find --prop KEY[=VALUE] [--prop KEY[=VALUE]]...\n"
 "  TARGET: a path/name in your mount, VIEW:DIR, an object ID, or omitted=cwd\n"
-"  (--flow/--effective apply to directory targets; a tag is key 'tag')\n"
+"  (targets come last, like chmod; --flow/--effective apply to directories;\n"
+"   a tag is key 'tag')\n"
 "\n"
 "Mounting:\n"
 "  mount NAME [--ro] [--foreground] [--verbose] MOUNTPOINT\n"
-"  mounts                           list mounted views and their mountpoints\n"
-"  unmount MOUNTPOINT\n"
+"  mount                            list mounted views and their mountpoints\n"
+"  umount MOUNTPOINT\n"
 "\n"
 "Diagnostics:\n"
 "  check [--fix] [--fill-checksums] [--verify-checksums] [--verbose]\n"
@@ -96,8 +97,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "prop"))    return cmd_prop   (argc, argv);
     if (!strcmp(cmd, "find"))    return cmd_find   (argc, argv);
     if (!strcmp(cmd, "mount"))   return cmd_mount  (argc, argv);
-    if (!strcmp(cmd, "mounts"))  return cmd_mounts (argc, argv);
-    if (!strcmp(cmd, "unmount")) return cmd_unmount(argc, argv);
+    if (!strcmp(cmd, "umount"))  return cmd_unmount(argc, argv);
     if (!strcmp(cmd, "check"))   return cmd_check  (argc, argv);
 
     fprintf(stderr, "vfs: unknown command '%s'\n", cmd);

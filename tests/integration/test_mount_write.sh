@@ -6,9 +6,9 @@ init_store
 
 "$VFS" view create v >/dev/null
 "$VFS" dir mkdir v /blake >/dev/null
-"$VFS" prop set v:/blake author blake --flow >/dev/null
+"$VFS" prop set author=blake v:/blake --flow >/dev/null
 "$VFS" dir mkdir v /blake/2024 >/dev/null
-"$VFS" prop set v:/blake/2024 year 2024 >/dev/null
+"$VFS" prop set year=2024 v:/blake/2024 >/dev/null
 
 mount_view v "$MNT/v"
 

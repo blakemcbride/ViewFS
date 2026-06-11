@@ -59,28 +59,23 @@ See:
 - `INSTALL.md` — build, configure PostgreSQL, optional system-wide install.
 - `RUNNING.md` — guided tutorial: views, directories, property filters,
   mounts, sharing, xattrs, diagnostics.
-- `Plan-rewrite.md` — the property-driven model and the rewrite plan
-  (authoritative for the current behavior).
-- `Design.md` / `Plan.md` — the original explicit-mapping design and build
-  plan (historical; superseded by the property model).
+- `Design.md` — the property-driven model: schema, path resolution, FUSE
+  semantics, the CLI surface, and design rationale (authoritative).
 - `viewfs_fuse_prototype_spec.md` — the spec this prototype targets.
 
 ## Status
 
-The prototype was first built explicit-mapping (one stored row per file
-placement) per `Plan.md`, then **rewritten to the property-driven model**
-described here per `Plan-rewrite.md`:
+The prototype is feature-complete for the property-driven model:
 
-| Phase | Scope | Status |
-|-------|-------|--------|
-| R0 | Property schema + libviewfs (membership, effective sets, flow) | ✓ |
-| R1 | CLI (`dir`, `prop`, `find --prop`, `object copy/name`) | ✓ |
-| R2 | FUSE daemon over computed membership (read + write) | ✓ |
-| R4 | Integration suite + docs/demo rewrite | ✓ |
-| R5 | `check` invariants, name-collision disambiguation (D2) | ✓ |
+| Area | Status |
+|------|--------|
+| Property schema + libviewfs (membership, effective sets, flow) | ✓ |
+| CLI (`dir`, `prop`, `find --prop`, `object copy/name`) | ✓ |
+| FUSE daemon over computed membership (read + write) | ✓ |
+| Integration suite + demo | ✓ |
+| `check` invariants, name-collision disambiguation | ✓ |
 
-`Design.md` and `Plan.md` document the original explicit-mapping build; the
-authoritative description of the current model is `Plan-rewrite.md`.
+The authoritative description of the model is `Design.md`.
 
 ## Architecture
 
@@ -113,7 +108,7 @@ make
 ```
 
 The `fuse3` package provides the `fusermount3` setuid helper used by
-`vfs unmount`; `fuse3-devel` provides `libfuse3` for the daemon link.
+`vfs umount`; `fuse3-devel` provides `libfuse3` for the daemon link.
 `postgresql` is needed for the client-side `psql` used by the demo
 script and by the integration tests; the server itself can be installed
 separately (`postgresql-server`).
@@ -194,15 +189,15 @@ mount; see below).
 
 ```sh
 # /by-author/blake matches objects whose properties include author=blake
-./vfs prop set docs:/by-author/blake author blake
+./vfs prop set author=blake docs:/by-author/blake
 
 # --flow makes a pair cascade to descendant directories
-./vfs prop set docs:/reports kind report --flow
-./vfs prop set docs:/reports/2024 year 2024
+./vfs prop set kind=report docs:/reports --flow
+./vfs prop set year=2024 docs:/reports/2024
 
 ./vfs prop list docs:/reports/2024              # own pairs only
 ./vfs prop list docs:/reports/2024 --effective  # incl. flowed ancestors
-./vfs prop unset docs:/reports/2024 year 2024
+./vfs prop unset year=2024 docs:/reports/2024
 ```
 
 With the pairs above, `/reports/2024`'s *effective* filter is
@@ -212,29 +207,31 @@ a strict subset of `/reports`.
 Inside a mounted view you rarely need to type `VIEW:DIR` at all — `prop` (and
 `dir mkdir`/`rmdir`/`ls`) infer the target from where you're standing:
 
-- the **`TARGET` is optional** on every `prop` subcommand — omit it and it
-  defaults to the directory you're standing in (or write `.`);
+- the **`TARGET` list is optional** on every `prop` subcommand — omit it and
+  it defaults to the directory you're standing in (or write `.`);
 - a **file** target is just its name (or a path) in the current directory;
 - a **directory** target can also be a relative/absolute path or `VIEW:DIR`;
-- `prop` decides file-vs-directory automatically from what the target names.
+- `prop` decides file-vs-directory automatically from what the target names;
+- give several targets at once — the operation applies to each, like `chmod`.
 
 ```sh
 cd /tmp/mnt/docs/reports
 vfs dir mkdir 2024              # -> docs:/reports/2024 (relative path)
-vfs prop set kind report --flow # set on the current directory (no TARGET)
+vfs prop set kind=report --flow # set on the current directory (no TARGET)
 cd 2024
-vfs prop set year 2024          # filter on the dir you're in
+vfs prop set year=2024          # filter on the dir you're in
 vfs prop unset year             # remove all values of a key from this dir
 vfs prop list --effective       # this directory's effective filter
-vfs prop set report.txt reviewed yes   # a file's property, by name
+vfs prop set reviewed=yes report.txt   # a file's property, by name
+vfs prop set reviewed=yes a.txt b.txt c.txt  # several files at once
 vfs prop list report.txt        # that file's properties
 vfs dir ls                      # the current dir's computed contents
 ```
 
-(`--flow` and `--effective` apply only to directory targets; using them on a
-file is an error. One corner case: `prop unset KEY VALUE` — two words — is
-read as a key/value on the *current directory*; to unset on a different
-target without giving a value, name it as `VIEW:DIR`.)
+(Targets come last, like `chmod`, so a property is written as a single
+`KEY=VALUE` token; for `unset` the value is optional and a bare `KEY` removes
+every value of that key. `--flow` and `--effective` apply only to directory
+targets; using them on a file is an error.)
 
 ### Importing files and giving them properties
 
@@ -248,10 +245,10 @@ echo 'Q3 revenue' > /tmp/q3.txt
 
 # properties drive membership; set them directly too (multi-valued).
 # the TARGET here is an object id, but it can also be a filename in a mount:
-./vfs prop set   <id> author blake
-./vfs prop set   <id> author jane        # same key, second value
+./vfs prop set   author=blake <id>
+./vfs prop set   author=jane  <id>       # same key, second value
 ./vfs prop list  <id>
-./vfs prop unset <id> author jane        # drop one value
+./vfs prop unset author=jane  <id>       # drop one value
 ./vfs find --prop kind=report --prop year=2024   # AND across pairs
 
 # see a directory's computed contents without mounting:
@@ -272,11 +269,11 @@ destination directory's pairs.
 ```sh
 mkdir -p /tmp/mnt/docs
 ./vfs mount   docs /tmp/mnt/docs
-./vfs mounts                       # list every mounted view + its mountpoint
-./vfs unmount /tmp/mnt/docs
+./vfs mount                        # list every mounted view + its mountpoint
+./vfs umount /tmp/mnt/docs
 ```
 
-`vfs mounts` reads `/proc/mounts` and lists each mounted ViewFS view, its
+`vfs mount` with no arguments reads `/proc/mounts` and lists each mounted ViewFS view, its
 mode (`rw`/`ro`), and its mountpoint — for example:
 
 ```text
@@ -286,7 +283,7 @@ archive              ro     /tmp/mnt/archive
 ```
 
 It needs no `--store`/`$VIEWFS_STORE` and reports every ViewFS mount on the
-system. `vfs unmount` is a thin wrapper around `fusermount3 -u`; the
+system. `vfs umount` is a thin wrapper around `fusermount3 -u`; the
 `fusermount3` setuid helper lives in the `fuse3` package on Fedora.
 
 Mount options:
@@ -337,7 +334,7 @@ copies. Writing through any mount updates that one underlying object:
 ```sh
 ./vfs view create archive
 ./vfs dir mkdir archive /2024
-./vfs prop set archive:/2024 year 2024
+./vfs prop set year=2024 archive:/2024
 # an object with year=2024 now shows in BOTH docs:/reports/2024 and
 # archive:/2024 — same object, two views, two filters.
 ```
@@ -358,12 +355,12 @@ attributes under the `user.viewfs.` namespace (everything else returns
 `ENOTSUP`):
 
 ```sh
-./vfs prop set  <id> language C        # by object id
+./vfs prop set  language=C <id>        # by object id
 ./vfs prop list <id>
 ./vfs find --prop language=C
 
 cd /tmp/mnt/docs/reports
-vfs prop set  q3.txt language C         # the same file, by name in a mount
+vfs prop set  language=C q3.txt         # the same file, by name in a mount
 vfs prop list q3.txt
 
 setfattr -n user.viewfs.author -v 'blake' /tmp/mnt/docs/reports/q3.txt
@@ -503,8 +500,7 @@ VIEWFS_TEST_PG='host=localhost user=postgres dbname=viewfs' make int-test
 ```
 ViewFS/
 ├── README.md                  -- this file
-├── Design.md                  -- design decisions, phase-by-phase
-├── Plan.md                    -- phased implementation plan
+├── Design.md                  -- property-driven model + design decisions
 ├── viewfs_fuse_prototype_spec.md
 ├── Makefile
 ├── include/viewfs/viewfs.h    -- public C API
@@ -545,7 +541,6 @@ ViewFS/
 │       ├── lib.sh             -- shared helpers + per-test isolation
 │       ├── run.sh             -- runner; iterates test_*.sh
 │       └── test_*.sh          -- 6 property-model end-to-end scripts
-├── Plan-rewrite.md            -- the property-model rewrite plan (authoritative)
 └── examples/
     └── demo.sh                -- property-model demonstration
 ```
@@ -567,7 +562,7 @@ PostgreSQL holds all metadata in a single configurable schema (default
 `viewfs`): `objects` + multi-valued `object_props`, `views`, the per-view
 `view_dirs` tree, and `view_dir_props` (the per-directory filters, each pair
 carrying a `flow` flag). The canonical schema is
-`src/libviewfs/migrations/0001_init.sql`; `Plan-rewrite.md` §3 explains it.
+`src/libviewfs/migrations/0001_init.sql`; `Design.md` §3 explains it.
 
 ## Durability
 
@@ -642,7 +637,7 @@ are welcome via the usual channels; please include the output of
 
 Conceived and orchestrated by **Blake McBride**.
 The implementation was written by **Claude Code** (Anthropic), guided
-phase-by-phase per `Plan.md` and `Design.md`.
+phase-by-phase per `Design.md`.
 
 ## License
 

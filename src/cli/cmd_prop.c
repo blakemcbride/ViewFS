@@ -2,12 +2,16 @@
  * DIRECTORY (its membership filter). One command covers both because both
  * are just (key,value) pairs; the TARGET decides which.
  *
- *   prop set    TARGET KEY VALUE [--flow]
- *   prop unset  TARGET KEY [VALUE]
- *   prop list   [TARGET] [--effective]
+ * Targets come last (like chmod), so each command takes a list of them:
+ *   prop set    KEY=VALUE   [TARGET...] [--flow]
+ *   prop unset  KEY[=VALUE] [TARGET...]
+ *   prop list   [TARGET...] [--effective]
+ * A property is written KEY=VALUE (one token); for unset the value is
+ * optional and a bare KEY removes every value of the key. The operation is
+ * applied to every TARGET; with none, the directory you are in (inside a
+ * mounted view) is used.
  *
  * TARGET resolution:
- *   (omitted, list only)  the directory you are in (inside a mounted view)
  *   "."  / a path / name  resolved against your current directory; a
  *                         directory -> its filter, a file -> its properties
  *   VIEW:DIR              a directory in any view, e.g. docs:/reports
@@ -16,6 +20,7 @@
  * --flow (set) and --effective (list) apply only to directory targets. */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "common.h"
@@ -31,17 +36,17 @@ struct prop_target {
 static void print_usage(FILE *out) {
     fprintf(out,
 "Usage: vfs prop <subcommand>\n"
-"  prop set    [TARGET] KEY VALUE [--flow]\n"
-"  prop unset  [TARGET] KEY [VALUE]\n"
-"  prop list   [TARGET] [--effective]\n"
+"  prop set    KEY=VALUE   [TARGET...] [--flow]\n"
+"  prop unset  KEY[=VALUE] [TARGET...]\n"
+"  prop list   [TARGET...] [--effective]\n"
 "\n"
-"  TARGET is what the properties belong to; omit it to use the directory you\n"
-"  are in (inside a mounted view). Otherwise:\n"
+"  The operation applies to every TARGET; omit them to use the directory you\n"
+"  are in (inside a mounted view). A TARGET is one of:\n"
 "    .  / path / name  resolved against your cwd; dir -> filter, file -> props\n"
 "    VIEW:DIR          a directory in any view (e.g. docs:/reports)\n"
 "    ID|PREFIX         an object (file) by id\n"
-"  Note: `prop unset KEY VALUE` (two words) removes VALUE of KEY from the\n"
-"  current directory; to target something else give a VIEW:DIR or a value.\n"
+"  A property is written KEY=VALUE; for unset the value is optional and a\n"
+"  bare KEY removes every value of that key.\n"
 "  --flow / --effective apply to directory targets.\n");
 }
 static int usage(void) { print_usage(stderr); return 2; }
@@ -138,75 +143,93 @@ int cmd_prop(int argc, char **argv) {
     int rc;
 
     if (!strcmp(sub, "set")) {
-        /* [TARGET] KEY VALUE: 2 positionals -> cwd, 3 -> explicit target. */
-        const char *tok, *key, *val;
-        if      (argc == 5) { tok = NULL;    key = argv[3]; val = argv[4]; }
-        else if (argc == 6) { tok = argv[3]; key = argv[4]; val = argv[5]; }
-        else { rc = usage(); goto done; }
-        if (resolve_target(s, tok, &t)) { rc = 1; goto done; }
-        target_label(&t, label, sizeof label);
-        vfs_error e;
-        if (t.kind == TGT_DIR) {
-            e = vfs_dir_prop_set(s, t.view, t.dir, key, val, flow_flag != NULL);
-        } else {
-            if (flow_flag) {
+        /* KEY=VALUE [TARGET...]: set the property on each TARGET (or the cwd
+         * directory when none are given). */
+        if (argc < 4) { rc = usage(); goto done; }
+        char *spec = strdup(argv[3]);
+        char *eq = spec ? strchr(spec, '=') : NULL;
+        if (!eq) {
+            fprintf(stderr, "vfs: prop set needs KEY=VALUE\n");
+            free(spec); rc = usage(); goto done;
+        }
+        *eq = '\0';
+        const char *key = spec, *val = eq + 1;
+        int ntgt = argc - 4, count = ntgt > 0 ? ntgt : 1;
+        rc = 0;
+        for (int i = 0; i < count; i++) {
+            const char *tok = ntgt > 0 ? argv[4 + i] : NULL;
+            if (resolve_target(s, tok, &t)) { rc = 1; continue; }
+            target_label(&t, label, sizeof label);
+            vfs_error e;
+            if (t.kind == TGT_DIR) {
+                e = vfs_dir_prop_set(s, t.view, t.dir, key, val, flow_flag != NULL);
+            } else if (flow_flag) {
                 fprintf(stderr, "vfs: --flow applies only to directories\n");
-                rc = 2; goto done;
+                rc = 2; continue;
+            } else {
+                e = vfs_object_prop_add(s, &t.id, key, val);
             }
-            e = vfs_object_prop_add(s, &t.id, key, val);
+            if (e != VFS_OK) rc = cli_perror(s, e, "prop set");
+            else printf("%s  %s=%s%s\n", label, key, val,
+                        (t.kind == TGT_DIR && flow_flag) ? " (flow)" : "");
         }
-        if (e != VFS_OK) rc = cli_perror(s, e, "prop set");
-        else { printf("%s  %s=%s%s\n", label, key, val,
-                      (t.kind == TGT_DIR && flow_flag) ? " (flow)" : ""); rc = 0; }
+        free(spec);
     } else if (!strcmp(sub, "unset")) {
-        /* [TARGET] KEY [VALUE]. The only ambiguous case is two words: read it
-         * as "KEY VALUE on the current directory" unless the first word is a
-         * VIEW:DIR (which is unmistakably a target). */
-        const char *tok, *key, *val;
-        if      (argc == 4) { tok = NULL;    key = argv[3]; val = NULL; }
-        else if (argc == 6) { tok = argv[3]; key = argv[4]; val = argv[5]; }
-        else if (argc == 5) {
-            if (strchr(argv[3], ':')) { tok = argv[3]; key = argv[4]; val = NULL; }
-            else                      { tok = NULL;    key = argv[3]; val = argv[4]; }
-        } else { rc = usage(); goto done; }
-        if (resolve_target(s, tok, &t)) { rc = 1; goto done; }
-        target_label(&t, label, sizeof label);
-        vfs_error e = (t.kind == TGT_DIR)
-            ? vfs_dir_prop_delete(s, t.view, t.dir, key, val)
-            : vfs_object_prop_unset(s, &t.id, key, val);
-        if (e == VFS_ERR_NOTFOUND) {
-            fprintf(stderr, "vfs: %s has no matching property\n", label);
-            rc = 1;
-        } else if (e != VFS_OK) {
-            rc = cli_perror(s, e, "prop unset");
-        } else {
-            printf("Unset %s %s%s%s\n", label, key, val ? "=" : "", val ? val : "");
-            rc = 0;
+        /* KEY[=VALUE] [TARGET...]: remove the property from each TARGET (or the
+         * cwd directory). A bare KEY removes every value of that key. */
+        if (argc < 4) { rc = usage(); goto done; }
+        char *spec = strdup(argv[3]);
+        char *eq = spec ? strchr(spec, '=') : NULL;
+        const char *val = NULL;
+        if (eq) { *eq = '\0'; val = eq + 1; }
+        const char *key = spec;
+        int ntgt = argc - 4, count = ntgt > 0 ? ntgt : 1;
+        rc = 0;
+        for (int i = 0; i < count; i++) {
+            const char *tok = ntgt > 0 ? argv[4 + i] : NULL;
+            if (resolve_target(s, tok, &t)) { rc = 1; continue; }
+            target_label(&t, label, sizeof label);
+            vfs_error e = (t.kind == TGT_DIR)
+                ? vfs_dir_prop_delete(s, t.view, t.dir, key, val)
+                : vfs_object_prop_unset(s, &t.id, key, val);
+            if (e == VFS_ERR_NOTFOUND) {
+                fprintf(stderr, "vfs: %s has no matching property\n", label);
+                rc = 1;
+            } else if (e != VFS_OK) {
+                rc = cli_perror(s, e, "prop unset");
+            } else {
+                printf("Unset %s %s%s%s\n", label, key, val ? "=" : "", val ? val : "");
+            }
         }
+        free(spec);
     } else if (!strcmp(sub, "list")) {
-        if (argc != 3 && argc != 4) { rc = usage(); goto done; }   /* [TARGET] */
-        const char *tok = (argc == 4) ? argv[3] : NULL;
-        if (resolve_target(s, tok, &t)) { rc = 1; goto done; }
-        if (t.kind == TGT_DIR) {
-            int exists = 0;
-            vfs_dir_exists(s, t.view, t.dir, &exists);
-            if (!exists) {
-                fprintf(stderr, "vfs: no directory %s:%s\n", t.view, t.dir);
-                rc = 1; goto done;
+        /* [TARGET...]: list properties of each TARGET (or the cwd directory). */
+        int ntgt = argc - 3, count = ntgt > 0 ? ntgt : 1;
+        rc = 0;
+        for (int i = 0; i < count; i++) {
+            const char *tok = ntgt > 0 ? argv[3 + i] : NULL;
+            if (resolve_target(s, tok, &t)) { rc = 1; continue; }
+            if (t.kind == TGT_DIR) {
+                int exists = 0;
+                vfs_dir_exists(s, t.view, t.dir, &exists);
+                if (!exists) {
+                    fprintf(stderr, "vfs: no directory %s:%s\n", t.view, t.dir);
+                    rc = 1; continue;
+                }
+                int effective = eff_flag != NULL;
+                printf("%s:%s %s filter:\n", t.view, t.dir, effective ? "effective" : "own");
+                vfs_error e = vfs_dir_prop_list(s, t.view, t.dir, effective,
+                                                print_dprop, &effective);
+                if (e != VFS_OK) rc = cli_perror(s, e, "prop list");
+            } else {
+                if (eff_flag) {
+                    fprintf(stderr, "vfs: --effective applies only to directories\n");
+                    rc = 2; continue;
+                }
+                printf("properties of %s:\n", t.id.hex);
+                vfs_error e = vfs_object_prop_list(s, &t.id, print_oprop, NULL);
+                if (e != VFS_OK) rc = cli_perror(s, e, "prop list");
             }
-            int effective = eff_flag != NULL;
-            printf("%s:%s %s filter:\n", t.view, t.dir, effective ? "effective" : "own");
-            vfs_error e = vfs_dir_prop_list(s, t.view, t.dir, effective,
-                                            print_dprop, &effective);
-            rc = (e == VFS_OK) ? 0 : cli_perror(s, e, "prop list");
-        } else {
-            if (eff_flag) {
-                fprintf(stderr, "vfs: --effective applies only to directories\n");
-                rc = 2; goto done;
-            }
-            printf("properties of %s:\n", t.id.hex);
-            vfs_error e = vfs_object_prop_list(s, &t.id, print_oprop, NULL);
-            rc = (e == VFS_OK) ? 0 : cli_perror(s, e, "prop list");
         }
     } else {
         rc = usage();

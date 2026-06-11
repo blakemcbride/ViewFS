@@ -1,4 +1,5 @@
-/* `vfs mounts` -- list the ViewFS views currently mounted and where.
+/* `vfs mount` (no arguments) -- list the ViewFS views currently mounted
+ * and where.
  *
  * Reads /proc/mounts (each daemon mounts with device "viewfs:<view>"), so it
  * needs no store and reports every ViewFS mount on the system regardless of
@@ -22,13 +23,13 @@ static void print_mount(const char *view, const char *mountpoint,
 
 int cmd_mounts(int argc, char **argv) {
     if (argc > 2 && cli_is_help_request(argv[2])) {
-        printf("Usage: vfs mounts\n"
+        printf("Usage: vfs mount\n"
                "  List the ViewFS views currently mounted and their "
                "mountpoints.\n");
         return 0;
     }
     if (argc != 2) {
-        fprintf(stderr, "Usage: vfs mounts\n");
+        fprintf(stderr, "Usage: vfs mount\n");
         return 2;
     }
 

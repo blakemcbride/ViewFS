@@ -279,7 +279,7 @@ Either create the role (`sudo -u postgres createuser -s "$USER"`) or
 include `user=postgres` in your conninfo and rely on local-socket
 trust auth.
 
-**`vfs unmount` says "fusermount3: not found".**
+**`vfs umount` says "fusermount3: not found".**
 Install the `fuse3` package (which provides the setuid helper).
 
 **`make test` hangs.**

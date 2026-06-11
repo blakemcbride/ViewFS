@@ -7,7 +7,8 @@
 > directory exactly when the file's properties are a **superset** of that
 > directory's *effective* filter. An earlier revision of this document
 > specified explicit path mappings and per-view filenames; that mechanism
-> has been replaced. `Plan-rewrite.md` is the companion implementation plan.
+> has been replaced. The current schema and design are described in
+> `Design.md`.
 
 ## 1. Purpose
 
@@ -311,9 +312,9 @@ filter on a directory; the *target* distinguishes them (an object id, a
 Example command shapes:
 
 ```sh
-vfs prop set    TARGET language C      # TARGET = object id, VIEW:DIR, or path
+vfs prop set    language=C TARGET      # TARGET = object id, VIEW:DIR, or path
 vfs prop list   TARGET
-vfs prop unset  TARGET language
+vfs prop unset  language TARGET
 vfs find --prop language=C
 vfs find --prop tag=draft --prop author=blake   # AND across pairs
 ```
@@ -327,8 +328,8 @@ by adding/removing placement rows. The administration tool shall provide:
 vfs dir mkdir   VIEW DIR
 vfs dir rmdir   VIEW DIR
 vfs dir ls      VIEW DIR             # computed contents
-vfs prop set    VIEW:DIR KEY VALUE [--flow]   # attach a filter pair
-vfs prop unset  VIEW:DIR KEY [VALUE]
+vfs prop set    KEY=VALUE VIEW:DIR [--flow]   # attach a filter pair
+vfs prop unset  KEY[=VALUE] VIEW:DIR
 vfs prop list   VIEW:DIR [--effective]
 ```
 
@@ -422,7 +423,7 @@ schema. (This revises the earlier prototype guidance, which suggested a
 local embedded store and avoiding a database server; the implementation uses
 PostgreSQL for its indexed relational-division membership queries and
 `LISTEN/NOTIFY` cache invalidation.) The schema is documented in
-`src/libviewfs/migrations/0001_init.sql` and explained in `Plan-rewrite.md`.
+`src/libviewfs/migrations/0001_init.sql` and explained in `Design.md`.
 
 ### 10.4 Content Storage
 
@@ -550,13 +551,15 @@ vfs object delete --orphaned [--dry-run]
 ### 13.6 Properties (files and directory filters)
 
 `TARGET` is an object id, a `VIEW:DIR`, or — inside a mount — a path/name.
-It is optional on every subcommand and defaults to the current directory.
-`--flow`/`--effective` apply to directory targets only.
+Targets come last (like `chmod`) and a list may be given; with none, each
+subcommand defaults to the current directory. A property is written as one
+`KEY=VALUE` token (for `unset` the value is optional; a bare `KEY` removes
+every value). `--flow`/`--effective` apply to directory targets only.
 
 ```sh
-vfs prop set    [TARGET] KEY VALUE [--flow]
-vfs prop unset  [TARGET] KEY [VALUE]
-vfs prop list   [TARGET] [--effective]
+vfs prop set    KEY=VALUE   [TARGET...] [--flow]
+vfs prop unset  KEY[=VALUE] [TARGET...]
+vfs prop list   [TARGET...] [--effective]
 vfs find --prop KEY[=VALUE] [--prop KEY[=VALUE]]...
 ```
 
@@ -743,7 +746,7 @@ The implementation is acceptable when all of the following are true:
 ```text
 viewfs/
   README.md
-  Plan-rewrite.md            (authoritative model + plan)
+  Design.md                  (authoritative model + design rationale)
   viewfs_fuse_prototype_spec.md
   Makefile
   include/viewfs/viewfs.h

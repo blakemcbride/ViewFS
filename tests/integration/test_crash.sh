@@ -7,7 +7,7 @@ init_store
 
 "$VFS" view create v >/dev/null
 "$VFS" dir mkdir v /d >/dev/null
-"$VFS" prop set v:/d k val >/dev/null
+"$VFS" prop set k=val v:/d >/dev/null
 
 mount_view v "$MNT/v"
 
