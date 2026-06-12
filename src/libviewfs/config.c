@@ -73,7 +73,14 @@ vfs_error vfs_store_load_config(vfs_store *s) {
 
     FILE *f = fopen(path, "r");
     if (!f) {
-        vfs_seterr(s, "open %s: %s", path, strerror(errno));
+        if (errno == ENOENT)
+            vfs_seterr(s,
+                "store '%s' is not initialized (no %s found). "
+                "Run 'vfs init %s' to create it.",
+                s->store_path, VFS_CONFIG_FILE, s->store_path);
+        else
+            vfs_seterr(s, "cannot open store config %s: %s",
+                       path, strerror(errno));
         return VFS_ERR_CONFIG;
     }
 
